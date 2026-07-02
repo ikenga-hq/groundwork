@@ -43,11 +43,11 @@ It is a [self-contained HTML artifact](https://ikenga.dev): open it in any brows
 
 `groundwork explorer` adds a second view beside the board: a file browser for the whole plan folder — a tree on the left, a tabbed viewer on the right. It opens the board, the living spec, and your designs as live preview tabs, with **full-text search** across every document.
 
-![groundwork explorer — file tree on the left, the plan board rendered live in a viewer tab](assets/ss-explorer.png)
+![groundwork explorer — two tabs open, the plan board rendered live in Kanban view](assets/ss-explorer.png)
 
 It's a single **fully-offline** file — React, the Markdown renderer, and the sanitizer are inlined, so it opens air-gapped, in Claude Desktop, or as a bare upload with no network. The view adapts to the profile: `design-system` opens on a gallery of live design thumbnails, `content` on a media grid.
 
-![groundwork explorer — the design-system profile's gallery of live mockup thumbnails](assets/ss-explorer-gallery.png)
+![groundwork explorer — the design-system profile's gallery with a locked design selected, previewing live](assets/ss-explorer-gallery.png)
 
 And `groundwork plans-index` rolls every plan in a directory into one dashboard — a card per plan with a work-package progress bar, drift indicator, and drill-in to each plan's explorer and board.
 
