@@ -77,7 +77,7 @@ plans/your-feature/
 
 ## Profiles
 
-A profile swaps vocabulary and optional blocks — not the spine. The safe-regeneration machinery is identical across all four.
+A profile swaps vocabulary and optional blocks — not the spine. The safe-regeneration machinery is identical across all five.
 
 | Profile | For | Work unit |
 |---|---|---|
@@ -85,8 +85,11 @@ A profile swaps vocabulary and optional blocks — not the spine. The safe-regen
 | `general` | Campaigns, org changes, non-code | workstream / deliverable |
 | `content` | Editorial work, content series | piece / asset |
 | `design-system` | Component/token systems | part |
+| `film` | Short films, music videos, trailers | sequence |
 
 The `design-system` profile adds a parts gallery, token pipeline, and a per-part quality gate.
+
+The `film` profile is a pre-production bible: logline, treatment, character and location bible, lookbook, shot ledger and render budget, locked at a **picture lock** gate. Choose between `content` and `film` by whether the work has *shots* — a film, video or trailer is `film`; articles and campaigns are `content`. It covers development and production management and hands execution off to your shot board, which stays the source of truth for per-shot state.
 
 ![design-system profile — living component gallery with foundations and parts tracked against tokens](assets/ss-designsystem-gallery.png)
 
