@@ -10,7 +10,7 @@ It's an open skill (Apache-2.0). It runs in plain Claude Code with nothing else 
 ## Install
 
 ```bash
-npx skills add royalti-io/groundwork
+npx skills add ikenga-hq/groundwork
 ```
 
 Project install (committed with the repo). Add `-g` for a global install. Needs a Claude Code environment and Node ≥ 18.
