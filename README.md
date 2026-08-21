@@ -3,7 +3,7 @@
 **A Claude Code skill that scaffolds and maintains a living plan folder. Re-runs augment your work — they never overwrite it.**
 
 ```bash
-npx skills add royalti-io/groundwork
+npx skills add ikenga-hq/groundwork
 ```
 
 Works with Claude Code, Codex, Gemini, Cursor, and 70+ other agents.
@@ -121,23 +121,23 @@ Add `--emit-workflow` to `orchestrate` for a runnable Claude Code Workflow that 
 
 ```bash
 # Global — available across all projects
-npx skills add royalti-io/groundwork -g
+npx skills add ikenga-hq/groundwork -g
 
 # Project — committed with your repo, shared with the team
-npx skills add royalti-io/groundwork
+npx skills add ikenga-hq/groundwork
 ```
 
 ### Git clone
 
 ```bash
-git clone https://github.com/royalti-io/groundwork.git
+git clone https://github.com/ikenga-hq/groundwork.git
 cp -r groundwork/skills/groundwork ~/.claude/skills/
 ```
 
 ### Curl one-liner
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/royalti-io/groundwork/main/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/ikenga-hq/groundwork/main/install.sh | bash
 ```
 
 The installer drops the skill into `~/.claude/skills/groundwork/` via symlink

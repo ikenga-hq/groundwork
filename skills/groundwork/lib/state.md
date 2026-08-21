@@ -135,7 +135,7 @@ gate(anchor.spine_version, action.expected_spine_version):
             proceed with read-only semantics
         else:
             refuse with: "plan is on spine_version={anchor}, this skill is on {expected}.
-                          Upgrade the groundwork skill (`npx skills add royalti-io/groundwork`) before writing."
+                          Upgrade the groundwork skill (`npx skills add ikenga-hq/groundwork`) before writing."
 ```
 
 Three clauses, hence three failure modes: **anchor-too-old** (most common at first v2 bump), **anchor-too-new + writing action** (user is on a newer plan than the installed skill), **anchor-too-new + read-only action** (degrade gracefully, return what we can).

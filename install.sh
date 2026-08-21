@@ -7,12 +7,12 @@
 # `git -C ~/.cache/ikenga-skills/groundwork pull`.
 #
 # Usage:
-#   curl -sSL https://raw.githubusercontent.com/royalti-io/groundwork/main/install.sh | bash
+#   curl -sSL https://raw.githubusercontent.com/ikenga-hq/groundwork/main/install.sh | bash
 #
 # Env overrides:
 #   SKILLS_DIR    target skills dir (default: $HOME/.claude/skills)
 #   CACHE_DIR     clone cache dir   (default: $HOME/.cache/ikenga-skills)
-#   REPO_URL      repo to clone     (default: https://github.com/royalti-io/groundwork.git)
+#   REPO_URL      repo to clone     (default: https://github.com/ikenga-hq/groundwork.git)
 #   REF           git ref to check out (default: main)
 
 set -euo pipefail
@@ -20,7 +20,7 @@ set -euo pipefail
 SKILL_NAME="groundwork"
 SKILLS_DIR="${SKILLS_DIR:-$HOME/.claude/skills}"
 CACHE_DIR="${CACHE_DIR:-$HOME/.cache/ikenga-skills}"
-REPO_URL="${REPO_URL:-https://github.com/royalti-io/groundwork.git}"
+REPO_URL="${REPO_URL:-https://github.com/ikenga-hq/groundwork.git}"
 REF="${REF:-main}"
 
 CLONE_DIR="$CACHE_DIR/$SKILL_NAME"

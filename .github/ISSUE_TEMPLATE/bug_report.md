@@ -17,4 +17,4 @@ What you expected instead.
 **Environment**
 - Agent (Claude Code / Codex / Gemini / Cursor / …) + version:
 - OS:
-- groundwork install (`npx skills add royalti-io/groundwork`, global or project):
+- groundwork install (`npx skills add ikenga-hq/groundwork`, global or project):
