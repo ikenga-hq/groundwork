@@ -1,4 +1,3 @@
-<!-- GENERATED — edit .claude/skills/groundwork/ instead. Synced by sync-from-dev.mjs. -->
 # {{plan_title}} — design-system planning folder
 
 Living design system + UX capture for **{{plan_title}}**. Built with the [groundwork](https://github.com/ikenga-hq/groundwork) `design-system` profile.

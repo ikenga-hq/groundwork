@@ -361,7 +361,7 @@ def cmd_spine_gate(args):
         emit({"result": "warn-readonly", "anchor": a, "expected": e})
         return
     die(f"plan is on spine_version={a}, this skill is on {e}. "
-        f"Upgrade the groundwork skill (`npx skills add royalti-io/groundwork`) before writing.", 3)
+        f"Upgrade the groundwork skill (`npx skills add ikenga-hq/groundwork`) before writing.", 3)
 
 
 # --------------------------------------------------------------------------- #
@@ -652,6 +652,172 @@ def cmd_register_id(args):
     emit({"result": "registered", "id": args.id, "entry": entry})
 
 
+def cmd_register_issue(args):
+    anchor = load_anchor(args.plan)
+    ids = anchor.setdefault("ids", {})
+    if args.id not in ids:
+        die(f"ID {args.id} not found in anchor", 1)
+    entry = ids[args.id]
+    labels = [x.strip() for x in args.labels.split(",")] if getattr(args, "labels", None) else ["groundwork"]
+    entry["issue"] = {
+        "provider": getattr(args, "provider", None) or "github",
+        "number": int(args.number),
+        "url": args.url,
+        "labels": labels,
+        "last_synced": _now(),
+    }
+    ids[args.id] = entry
+    save_anchor(args.plan, anchor)
+    emit({"result": "registered", "id": args.id, "issue": entry["issue"]})
+
+
+def cmd_register_milestone(args):
+    anchor = load_anchor(args.plan)
+    milestones = anchor.setdefault("milestones", {})
+    milestones[args.phase] = {
+        "id": args.id,
+        "title": args.title,
+        "url": args.url,
+        "registered_at": _now(),
+    }
+    save_anchor(args.plan, anchor)
+    emit({"result": "registered", "phase": args.phase, "milestone": milestones[args.phase]})
+
+
+def _extract_phase_titles(plan_dir: str) -> dict:
+    p1 = os.path.join(plan_dir, "01-plan.md")
+    if not os.path.exists(p1):
+        return {}
+    content = read_file(p1)
+    phases_section = content
+    m_sec = re.search(r"^##\s*Phases\b.*?\n(.*?)(?=\n##\s+[^\s]|\Z)", content, re.DOTALL | re.MULTILINE | re.IGNORECASE)
+    if m_sec:
+        phases_section = m_sec.group(1)
+
+    pat = re.compile(r"^#+\s*Phase\s*(\d+)[\s:·—\-]+([^\n\#]+)", re.MULTILINE | re.IGNORECASE)
+    res = {}
+    for m in pat.finditer(phases_section):
+        p_num = f"P{m.group(1)}"
+        subtitle = m.group(2).strip()
+        if "verification" in subtitle.lower() or "gate" in subtitle.lower():
+            continue
+        subtitle = re.sub(r"\s*\([^)]*\)", "", subtitle).strip().rstrip("·—-: ")
+        if subtitle and p_num not in res:
+            res[p_num] = subtitle
+    return res
+
+
+def cmd_issue_sync_data(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    ids = anchor.get("ids", {})
+    milestones = anchor.get("milestones", {})
+    briefs = _extract_wp_briefs(plan)
+    phase_titles = _extract_phase_titles(plan)
+
+    # Map children (WPs that list this WP in depends_on)
+    children_map = {}
+    for k, v in ids.items():
+        if k.startswith("WP-"):
+            for dep in v.get("depends_on", []):
+                if dep.startswith("WP-"):
+                    children_map.setdefault(dep, []).append(k)
+
+    wps = []
+    with_tasklists = getattr(args, "with_tasklists", False)
+    for k, v in ids.items():
+        if k.startswith("WP-"):
+            child_ids = sorted(children_map.get(k, []))
+            child_wps = []
+            tasklist_md = ""
+            if child_ids:
+                lines = []
+                for cid in child_ids:
+                    c_entry = ids.get(cid, {})
+                    c_status = c_entry.get("status", "queued")
+                    c_done = c_status == "done"
+                    c_issue = c_entry.get("issue")
+                    c_num = f"#{c_issue['number']}" if c_issue and "number" in c_issue else cid
+                    lines.append(f"- [{'x' if c_done else ' '}] {c_num} — {cid}: {c_entry.get('title', cid)}")
+                    child_wps.append({
+                        "id": cid,
+                        "title": c_entry.get("title", ""),
+                        "status": c_status,
+                        "issue": c_issue,
+                    })
+                tasklist_md = "### Dependent Work Packages\n" + "\n".join(lines)
+
+            wp_item = {
+                "id": k,
+                "title": v.get("title", ""),
+                "status": v.get("status", "queued"),
+                "wave": v.get("wave"),
+                "phase": v.get("phase", f"P{v.get('wave', 0) + 1}"),
+                "tier": v.get("tier"),
+                "depends_on": v.get("depends_on", []),
+                "gate": v.get("gate"),
+                "brief": briefs.get(k, ""),
+                "issue": v.get("issue"),
+                "children": child_wps,
+                "updated_at": v.get("updated_at") or anchor.get("updated"),
+            }
+            if with_tasklists and tasklist_md:
+                wp_item["tasklist_md"] = tasklist_md
+            wps.append(wp_item)
+
+    emit({
+        "plan_title": _plan_title(plan, anchor),
+        "plan_slug": os.path.basename(os.path.normpath(plan)),
+        "profile": anchor.get("profile"),
+        "milestones": milestones,
+        "phase_titles": phase_titles,
+        "wps": wps,
+    })
+
+
+def cmd_apply_issue_sync(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    ids = anchor.setdefault("ids", {})
+    data = {}
+    if getattr(args, "updates_file", None):
+        with open(args.updates_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+    applied_reg = 0
+    applied_stat = 0
+    now_str = _now()
+
+    for reg in data.get("issue_registrations", []):
+        wp_id = reg.get("id")
+        if wp_id in ids:
+            ids[wp_id]["issue"] = {
+                "provider": reg.get("provider", "github"),
+                "number": int(reg.get("number")),
+                "url": reg.get("url"),
+                "labels": reg.get("labels", ["groundwork"]),
+                "last_synced": now_str,
+            }
+            applied_reg += 1
+
+    for st in data.get("status_updates", []):
+        wp_id = st.get("id")
+        new_status = st.get("status")
+        if wp_id in ids and new_status:
+            ids[wp_id]["status"] = new_status
+            ids[wp_id]["updated_at"] = now_str
+            if "issue" in ids[wp_id]:
+                ids[wp_id]["issue"]["last_synced"] = now_str
+            applied_stat += 1
+
+    save_anchor(args.plan, anchor)
+    emit({
+        "result": "ok",
+        "applied_registrations": applied_reg,
+        "applied_status_updates": applied_stat,
+    })
+
+
 # --------------------------------------------------------------------------- #
 # command: board-data / status-data
 # --------------------------------------------------------------------------- #
@@ -705,6 +871,8 @@ def cmd_board_data(args):
             wp = {"id": k, "title": v.get("title", ""), "wave": v.get("wave"),
                   "deps": v.get("depends_on", []), "status": v.get("status", "queued"),
                   "gate": v.get("gate"), "tier": v.get("tier")}
+            if v.get("issue"):
+                wp["issue"] = v.get("issue")
             if getattr(args, "with_briefs", False):
                 wp["brief"] = briefs.get(k)
             wps.append(wp)
@@ -752,11 +920,13 @@ def cmd_status_data(args):
         profiles_report = [validate_profile(args.profiles_root, n)
                            for n in sorted(os.listdir(args.profiles_root))
                            if os.path.isdir(os.path.join(args.profiles_root, n))]
+    wps_with_issues = sum(1 for k, v in ids.items() if k.startswith("WP-") and v.get("issue"))
     emit({
         "profile": anchor.get("profile"), "spine_version": anchor.get("spine_version"),
         "goal": anchor.get("goal"), "created": anchor.get("created"), "updated": anchor.get("updated"),
         "docs": doc_report,
         "ids": {"gaps": gaps, "gates": gates, "wps": wps, "designs": designs_n, "total": len(ids)},
+        "issues": {"linked": wps_with_issues, "total_wps": wps},
         "subplans": [{"path": p, "archetype": d.get("archetype"), "status": d.get("status", "active"),
                       "ref": d.get("ref")} for p, d in anchor.get("subplans", {}).items()],
         "designs": anchor.get("designs", {}),
@@ -1469,6 +1639,33 @@ def build_parser() -> argparse.ArgumentParser:
                             "(phases from 05, rounds from 04 rounds-index, risks from 01 §Risks)")
     g.add_argument("--plan", required=True)
     g.set_defaults(func=cmd_living_spec_data)
+
+    g = sub.add_parser("register-issue", help="register a git issue for a WP in the anchor")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--id", required=True)
+    g.add_argument("--number", required=True, type=int)
+    g.add_argument("--url", required=True)
+    g.add_argument("--provider", default="github")
+    g.add_argument("--labels")
+    g.set_defaults(func=cmd_register_issue)
+
+    g = sub.add_parser("register-milestone", help="register a forge milestone for a phase in the anchor")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--phase", required=True)
+    g.add_argument("--title", required=True)
+    g.add_argument("--id", required=True)
+    g.add_argument("--url", required=True)
+    g.set_defaults(func=cmd_register_milestone)
+
+    g = sub.add_parser("issue-sync-data", help="emit model for git issue sync & export")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--with-tasklists", action="store_true", help="include tasklists markdown for parent WPs with child dependents or subplans")
+    g.set_defaults(func=cmd_issue_sync_data)
+
+    g = sub.add_parser("apply-issue-sync", help="apply batch status updates and issue registrations from git issue sync")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--updates-file", required=True)
+    g.set_defaults(func=cmd_apply_issue_sync)
 
     return p
 

@@ -1,4 +1,3 @@
-<!-- GENERATED — edit .claude/skills/groundwork/ instead. Synced by sync-from-dev.mjs. -->
 <!doctype html>
 <html lang="en" data-theme="A" data-mode="dark" data-density="comfortable">
 <head>
@@ -1232,6 +1231,10 @@ WHAT TO DO RIGHT NOW
         surface: 'new-session', icon: 'copy', disabled: false, needsPicker: 'subplan',
         standaloneForm: '/groundwork subplan --archetype {archetype} --topic "{topic}" --ref {ref}',
         seededForm: 'Scaffold a new groundwork sub-plan in `{plan_folder}` (plan title: {plan_title}).\n\nArchetype: {archetype} (one of: diff-plan, decision-doc, bug-doc). Topic: {topic}. Reference: {ref}.\n\nIf the groundwork skill is loaded in this session, follow its `subplan` action verbatim — read `.claude/skills/groundwork/actions/subplan.md`, resolve the next free `NN` number ≥ 06, render the matching template from `profiles/_shared/templates/subplans/{archetype}.md`, write to `{plan_folder}/NN-<slug>.md`, register in `.groundwork.json.subplans`, and cross-link from `00-README.md`. If the skill is not loaded, read the canonical reference instance for the archetype (`{plan_folder}/06-startSeededChat-extraction.md` for diff-plan, `07-spine-version-migration.md` for decision-doc, `08-index-board-fence-confusion.md` for bug-doc) and mirror its section shape with the new topic.\n\nDon\'t reuse a number already in use; don\'t write to 09 (reserved for orchestrate).' },
+      { id: 'issue-sync', label: 'Sync Git issues', desc: 'Sync WP status with GitHub/GitLab/git-bug issues',
+        surface: 'active-session', icon: 'git-pull-request', disabled: false,
+        standaloneForm: '/groundwork issue-sync',
+        seededForm: 'Run groundwork issue-sync on `{plan_folder}` (plan title: {plan_title}).\n\nIf the groundwork skill is loaded in this session, follow its `issue-sync` action verbatim — read `.claude/skills/groundwork/actions/issues.md`, detect available provider CLI (gh, glab, or git-bug), provision missing milestones/issues, and perform timestamped bi-directional status sync. If the skill is not loaded, inspect `{plan_folder}/.groundwork.json` and sync WP issue statuses by hand.' },
       { id: 'init',     label: 'Initialize plan', desc: 'Scaffold a new groundwork plan folder',
         surface: 'new-session', icon: 'spark', disabled: false, needsPicker: 'init',
         standaloneForm: '/groundwork init {target_folder} --profile {profile} --goal "{goal}"',
@@ -1611,7 +1614,7 @@ WHAT TO DO RIGHT NOW
        top-right cluster alongside the host badge + package count. No separate
        sticky controls bar — the page-head IS the chrome. Theme / mode / density
        are NEVER switchable here; the shell pushes them via host-context. */
-    function PageHead({ data, meta, filter, setFilter, counts, layout, setLayout, inShell, done, onKickoff, onOpenPalette }) {
+    function PageHead({ data, meta, filter, setFilter, counts, layout, setLayout, inShell, done, onKickoff, onOpenPalette, availablePhases, milestoneFilter, setMilestoneFilter }) {
       const planTitle = meta.title || data.plan?.title || 'this plan';
       const kickoffHint = inShell
         ? 'Spawns the orchestrator agent · mirrors WPs to Tasks · drives waves to completion.'
@@ -1642,6 +1645,22 @@ WHAT TO DO RIGHT NOW
                 <Icon name="bolt" size={12} /> Run<span aria-hidden="true">…</span>
                 <span className="palette-kbd" aria-hidden="true">⌘K</span>
               </button>
+              <button
+                className="btn btn-sm"
+                onClick={() => {
+                  const cmd = `/groundwork issue-sync ${meta.plan_folder || 'plans/groundwork'}`;
+                  if (inShell && window.art?.sendToActiveSession) {
+                    window.art.sendToActiveSession(cmd);
+                  } else {
+                    navigator.clipboard.writeText(cmd);
+                    alert('Copied issue-sync command to clipboard:\n' + cmd);
+                  }
+                }}
+                title="Sync WP status with Git issues (gh / glab / git-bug)"
+                aria-label="Sync Git issues"
+              >
+                <Icon name="git-pull-request" size={12} /> Sync Issues
+              </button>
               <div className="seg seg-sm" role="tablist" aria-label="Board layout">
                 <button className={layout === 'mission-control' ? 'is-on' : ''} onClick={() => setLayout('mission-control')} title="Mission Control — dense WP table + cross-cutting rail">
                   <Icon name="table" size={12} /> Mission Control
@@ -1653,6 +1672,16 @@ WHAT TO DO RIGHT NOW
                   <Icon name="git-fork" size={12} /> DAG
                 </button>
               </div>
+              {availablePhases && availablePhases.length > 0 && (
+                <div className="seg seg-sm" role="tablist" aria-label="Phase filter">
+                  <button className={milestoneFilter === 'all' ? 'is-on' : ''} onClick={() => setMilestoneFilter('all')} title="Show all phases">All</button>
+                  {availablePhases.map(p => (
+                    <button key={p} className={milestoneFilter === p ? 'is-on' : ''} onClick={() => setMilestoneFilter(p)} title={`Filter by phase ${p}`}>
+                      {p}
+                    </button>
+                  ))}
+                </div>
+              )}
               <div className="seg seg-sm">
                 <button onClick={() => location.reload()} title="Reload the board from disk (picks up a refresh-board run)" aria-label="Reload board">
                   <Icon name="refresh" size={12} />
@@ -1811,7 +1840,14 @@ WHAT TO DO RIGHT NOW
           {wp.status !== 'done' && (
             <div className="detail-actions">
               <button className="btn" onClick={() => onCopy(wp)}><Icon name="copy" size={11} /> Copy brief</button>
-              <button className="btn is-primary" onClick={() => onStart(wp)} title={inShell ? "Send this WP's brief to your Chi" : 'Copy-prompt path'}><Icon name="play" size={10} /> Start</button>
+              {inShell ? (
+                <>
+                  <button className="btn is-primary" onClick={(e) => onStart(wp, e.shiftKey ? 'active-session' : 'new-session')} title="Start in new session dialog (Shift+Click to send to active session)"><Icon name="play" size={10} /> Start</button>
+                  <button className="btn btn-sm" onClick={() => onStart(wp, 'active-session')} title="Send brief directly to active session thread"><Icon name="send" size={10} /> Send to active</button>
+                </>
+              ) : (
+                <button className="btn is-primary" onClick={() => onStart(wp)} title="Outside Ikenga → copy prompt"><Icon name="play" size={10} /> Start</button>
+              )}
             </div>
           )}
         </section>
@@ -1923,7 +1959,14 @@ WHAT TO DO RIGHT NOW
                       {wp.status !== 'done' && (
                         <span className="wp-actions">
                           <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); onCopy(wp); }}><Icon name="copy" size={11} /> Copy</button>
-                          <button className="btn btn-sm is-primary" onClick={(e) => { e.stopPropagation(); onStart(wp); }} title={inShell ? "Send this WP's brief to your Chi" : 'Copy-prompt path'}><Icon name="play" size={10} /> Start</button>
+                          {inShell ? (
+                            <>
+                              <button className="btn btn-sm is-primary" onClick={(e) => { e.stopPropagation(); onStart(wp, e.shiftKey ? 'active-session' : 'new-session'); }} title="Start in new session (Shift+Click to send to active)"><Icon name="play" size={10} /> Start</button>
+                              <button className="btn btn-sm" onClick={(e) => { e.stopPropagation(); onStart(wp, 'active-session'); }} title="Send to active session thread"><Icon name="send" size={10} /> Send</button>
+                            </>
+                          ) : (
+                            <button className="btn btn-sm is-primary" onClick={(e) => { e.stopPropagation(); onStart(wp); }} title="Outside Ikenga → copy prompt"><Icon name="play" size={10} /> Start</button>
+                          )}
                         </span>
                       )}
                     </td>
@@ -1992,7 +2035,14 @@ WHAT TO DO RIGHT NOW
                     {wp.status !== 'done' && (
                       <div className="wp-card-actions">
                         <span className="btn btn-sm" onClick={(e) => { e.stopPropagation(); onCopy(wp); }}><Icon name="copy" size={10} /> Copy brief</span>
-                        <span className="btn btn-sm is-primary" onClick={(e) => { e.stopPropagation(); onStart(wp); }}><Icon name="play" size={9} /> Start</span>
+                        {inShell ? (
+                          <>
+                            <span className="btn btn-sm is-primary" onClick={(e) => { e.stopPropagation(); onStart(wp, e.shiftKey ? 'active-session' : 'new-session'); }} title="Start in new session (Shift+Click to send to active)"><Icon name="play" size={9} /> Start</span>
+                            <span className="btn btn-sm" onClick={(e) => { e.stopPropagation(); onStart(wp, 'active-session'); }} title="Send to active session thread"><Icon name="send" size={9} /> Send</span>
+                          </>
+                        ) : (
+                          <span className="btn btn-sm is-primary" onClick={(e) => { e.stopPropagation(); onStart(wp); }} title="Outside Ikenga → copy prompt"><Icon name="play" size={9} /> Start</span>
+                        )}
                       </div>
                     )}
                   </button>
@@ -2267,9 +2317,22 @@ WHAT TO DO RIGHT NOW
     function App({ art }) {
       const [layout,   setLayout]   = useState('mission-control');
       const [filter,   setFilter]   = useState('all');
+      const [milestoneFilter, setMilestoneFilter] = useState('all');
       const [selected, setSelected] = useState((DATA.wps[0] || {}).id);
       const [toast,    setToast]    = useState(null);
       const [paletteOpen, setPaletteOpen] = useState(false);
+
+      const availablePhases = useMemo(() => {
+        const phases = new Set();
+        (DATA.wps || []).forEach(w => phases.add(w.phase || `P${(w.wave||0)+1}`));
+        return Array.from(phases).sort();
+      }, []);
+
+      const filteredData = useMemo(() => {
+        if (milestoneFilter === 'all') return DATA;
+        const filteredWps = (DATA.wps || []).filter(w => (w.phase || `P${(w.wave||0)+1}`) === milestoneFilter);
+        return { ...DATA, wps: filteredWps };
+      }, [milestoneFilter]);
       // Picker modal state (WP-23). null when closed; otherwise { kind:
       // 'subplan'|'init', action }. WP-23 pickers collect action arguments;
       // they live alongside paletteOpen so the palette can close + the picker
@@ -2339,14 +2402,13 @@ WHAT TO DO RIGHT NOW
         return false;
       };
 
-      const onStart = async (wp) => {
+      const onStart = async (wp, mode = 'new-session') => {
         const text = briefFor(wp);
         const label = `${wp.id} — ${wp.title}`;
-        // In-shell: round-trip to art.openSessionDialog (WP-27) — the shell's
-        // New-Session dialog opens pre-filled with the brief, user picks
-        // chat/terminal + engine + cwd + clicks Start. Clipboard is the floor
-        // when the verb is absent / dialog cancelled / standalone.
-        if (inShell && art.openSessionDialog) {
+        if (mode === 'active-session' && inShell && art.sendToActiveSession) {
+          const res = await art.sendToActiveSession({ prompt: text, source: 'wp-card' });
+          if (flashResult(wp.id, res)) return;
+        } else if (inShell && art.openSessionDialog) {
           const res = await art.openSessionDialog({ initialPrompt: text, title: label, source: 'wp-card' });
           if (flashResult(wp.id, res)) return;
         }
@@ -2382,22 +2444,23 @@ WHAT TO DO RIGHT NOW
          {placeholder} tokens fill from the form rather than the META fallbacks.
          The standalone slash form is always what hits the clipboard so a user can
          drop it into any chat surface. */
-      const dispatchAction = async (action, extraMeta) => {
+      const dispatchAction = async (action, extraMeta, targetSurface) => {
         const meta = extraMeta ? { ...META, ...extraMeta } : META;
         const seeded = substituteAction(action.seededForm, meta, DATA.plan);
         const standalone = substituteAction(action.standaloneForm, meta, DATA.plan);
         const title = `groundwork · ${action.label}`;
+        const surface = targetSurface || action.surface;
         let result = { ok: false, reason: 'no-verb' };
         try {
-          if (action.surface === 'new-session' && art.openSessionDialog) {
+          if (surface === 'new-session' && art.openSessionDialog) {
             result = await art.openSessionDialog({ initialPrompt: seeded, title, source: 'palette' });
-          } else if (action.surface === 'active-session' && art.sendToActiveSession) {
+          } else if (surface === 'active-session' && art.sendToActiveSession) {
             result = await art.sendToActiveSession({ prompt: seeded, source: 'palette' });
           }
         } catch (e) { result = { ok: false, reason: 'threw' }; }
 
         if (result && result.ok) {
-          flash(action.surface === 'new-session'
+          flash(surface === 'new-session'
             ? (result.kind === 'terminal' ? `Started ${action.label} in terminal` : `Seeded new chat → ${action.label}`)
             : `Sent to active session → ${action.label}`);
           return;
@@ -2420,13 +2483,15 @@ WHAT TO DO RIGHT NOW
              pre-filled (research / design / review / orchestrate).
            · surface: 'active-session'       → dispatchAction → sendToActiveSession
              (clarify / status / refresh-board). */
-      const onPaletteFire = (action) => {
+      const onPaletteFire = (action, event) => {
         if (action.disabled) return;
         setPaletteOpen(false);
+        const isShift = event && (event.shiftKey || event.altKey);
+        const targetSurface = isShift ? (action.surface === 'new-session' ? 'active-session' : 'new-session') : action.surface;
         if (action.needsPicker === 'subplan' || action.needsPicker === 'init') {
-          setPicker({ kind: action.needsPicker, action }); return;
+          setPicker({ kind: action.needsPicker, action, targetSurface }); return;
         }
-        dispatchAction(action);
+        dispatchAction(action, null, targetSurface);
       };
 
       // onPickerSubmit (WP-23) — close the picker, then dispatch with the
@@ -2436,7 +2501,7 @@ WHAT TO DO RIGHT NOW
         const cur = picker;
         setPicker(null);
         if (!cur || !cur.action) return;
-        dispatchAction(cur.action, values);
+        dispatchAction(cur.action, values, cur.targetSurface);
       };
 
       const counts = useMemo(() => DATA.wps.reduce((a, w) => (a[w.status] = (a[w.status]||0)+1, a), {}), []);
@@ -2458,16 +2523,19 @@ WHAT TO DO RIGHT NOW
               top of this main element. Round 8 layout pass. */}
           <main className="scroll-area">
             <PageHead
-              data={DATA} meta={META}
+              data={filteredData} meta={META}
               filter={filter} setFilter={setFilter} counts={counts}
               layout={layout} setLayout={setLayout}
               inShell={inShell} done={done}
               onKickoff={onKickoff}
               onOpenPalette={() => setPaletteOpen(true)}
+              availablePhases={availablePhases}
+              milestoneFilter={milestoneFilter}
+              setMilestoneFilter={setMilestoneFilter}
             />
-            {layout === 'mission-control' ? <MissionControl   data={DATA} selected={selected} setSelected={setSelected} selectedWp={selectedWp} subplan={subplan} filter={filter} onCopy={onCopy} onStart={onStart} onClear={onClear} inShell={inShell} /> :
-             layout === 'kanban'          ? <Kanban           data={DATA} selected={selected} setSelected={setSelected} selectedWp={selectedWp} subplan={subplan}                onCopy={onCopy} onStart={onStart} onClear={onClear} inShell={inShell} /> :
-                                            <DagHierarchical  data={DATA} selected={selected} setSelected={setSelected} selectedWp={selectedWp} subplan={subplan}                onCopy={onCopy} onStart={onStart} onClear={onClear} inShell={inShell} />
+            {layout === 'mission-control' ? <MissionControl   data={filteredData} selected={selected} setSelected={setSelected} selectedWp={selectedWp} subplan={subplan} filter={filter} onCopy={onCopy} onStart={onStart} onClear={onClear} inShell={inShell} /> :
+             layout === 'kanban'          ? <Kanban           data={filteredData} selected={selected} setSelected={setSelected} selectedWp={selectedWp} subplan={subplan}                onCopy={onCopy} onStart={onStart} onClear={onClear} inShell={inShell} /> :
+                                            <DagHierarchical  data={filteredData} selected={selected} setSelected={setSelected} selectedWp={selectedWp} subplan={subplan}                onCopy={onCopy} onStart={onStart} onClear={onClear} inShell={inShell} />
             }
           </main>
           <footer className="page-foot">

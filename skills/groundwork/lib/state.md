@@ -1,4 +1,3 @@
-<!-- GENERATED — edit .claude/skills/groundwork/ instead. Synced by sync-from-dev.mjs. -->
 # groundwork — plan state, identity & idempotency
 
 The reference every action obeys. If two actions disagree about what is "generated" versus "hand-written," the bug is here, not in the actions. Read this once; the action files are thin and assume these rules.
@@ -39,6 +38,10 @@ python3 <skill>/scripts/groundwork_state.py <subcommand> [args]
   explorer-data    --plan DIR                                # typed file-tree model for artifact/explorer.html
   plans-index-data --plans-dir DIR                           # cross-plan rollup of every plan under a plans/ dir
   write-region-plain --file PATH --id ID (--content STR | --content-file P)  # anchorless fence write (plans-index)
+  register-issue   --plan DIR --id ID --number N --url URL [--provider P] [--labels L]
+  register-milestone --plan DIR --phase P1 --title T --id ID --url URL
+  issue-sync-data  --plan DIR                                # JSON model for issue sync & export
+  apply-issue-sync --plan DIR --updates-file PATH            # apply batch status updates from git issue sync
 ```
 
 Every subcommand prints a JSON result to stdout (parse it to report back). Exit codes: `0` ok · `1` hard error/refusal · `2` missing/corrupt anchor · `3` spine-gate refusal. The contract details below define *why* each behaves as it does; the script is *how*.
@@ -79,7 +82,7 @@ Lives at the root of every groundwork plan folder (alongside `00-README.md`). It
   },
   "ids": {                              // global ID registry (Round 2 traceability)
     "G-01": { "doc": "04-discussion.md", "round": 2, "status": "folded",   "touches": ["01-plan.md", "05-tracking.md"] },
-    "WP-01": { "doc": "05-tracking.md",  "wave": 0,  "status": "queued",   "depends_on": [], "gate": "G-CANVAS", "tier": "opus" },
+    "WP-01": { "doc": "05-tracking.md",  "wave": 0,  "status": "queued",   "depends_on": [], "gate": "G-CANVAS", "tier": "opus", "issue": { "provider": "github", "number": 42, "url": "https://github.com/org/repo/issues/42", "last_synced": "2026-08-23T12:34:00Z" } },
     "G-SCHEMA": { "kind": "freeze_gate", "wp": "WP-02", "status": "pending" }
   },
   "designs": {                          // Round 3 — design coverage tracking
