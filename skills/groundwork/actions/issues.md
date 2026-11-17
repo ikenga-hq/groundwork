@@ -20,6 +20,16 @@ Maps each Work Package (`WP-NN`) 1:1 to a native Git Issue on GitHub or GitLab u
 
 ---
 
+## Write confirmation (required)
+
+Every remote write below (`gh issue create`, `gh issue close`, `gh issue reopen`, `gh api .../milestones`, and the `glab` equivalents) runs with the user's own credentials and publishes plan text (WP titles, briefs, definitions of done) to the target repo. **Before the first write of any run, stop and confirm with the user** (`AskUserQuestion`):
+
+- name the target repo (`owner/repo`, from `git remote -v`) and its **visibility** (public or private; check with `gh repo view --json visibility` / `glab repo view`) — if visibility cannot be determined, say so and treat it as public;
+- show exactly what will be posted: the issue titles and bodies, milestones to create, and issues to close/reopen;
+- proceed only on an explicit yes. Reads (`issue-sync-data`, `gh issue list`, `gh pr list`) need no confirmation.
+
+---
+
 ## Execution Protocol
 
 ### Step 1: Read Plan Issue Model
@@ -68,6 +78,7 @@ For each WP where `issue` is `null`:
    ```markdown
    ## <WP-ID>: <title>
    **Plan**: <plan_slug> | **Phase**: <phase> | **Wave**: <wave> | **Tier**: <tier>
+   **Implements**: <`ids[WP].implements` as D-NN list, or "none">
 
    ### Brief & Definition of Done
    <brief>
@@ -122,8 +133,15 @@ For each linked WP:
      gh issue reopen <NUM>
      ```
 
-2. **Apply Updates**:
-   Write update payload to a temp file `/tmp/gw-issue-updates.json`:
+2. **Pull design implementation from PRs**: for each linked WP, list its PRs (`gh pr list --search "<WP-ID> in:title,body" --state all --json number,url,state,body`). Parse the body's `Designs implemented:` line (template in `actions/orchestrate.md` §"PR body template") and record it:
+   ```bash
+   python3 <skill>/scripts/groundwork_state.py register-design-impl --plan <plan> --wp <WP-ID> \
+     --designs <D-01,D-03 | none> --pr <NUM> --url <URL> --pr-state <open|merged|closed>
+   ```
+   GitHub's `MERGED` maps to `merged`, and `CLOSED` without a merge to `closed`. The command is idempotent, so re-syncing an unchanged PR writes nothing. A PR with no such line is skipped with a warning: it can't be tied to a design.
+
+3. **Apply Updates**:
+   Create a per-run temp file (`UPDATES=$(mktemp "${TMPDIR:-/tmp}/gw-issue-updates.XXXXXX.json")`, never a fixed path) and write the update payload to it:
    ```json
    {
      "issue_registrations": [],
@@ -134,7 +152,8 @@ For each linked WP:
    ```
    Apply updates back to `.groundwork.json`:
    ```bash
-   python3 <skill>/scripts/groundwork_state.py apply-issue-sync --plan <plan> --updates-file /tmp/gw-issue-updates.json
+   python3 <skill>/scripts/groundwork_state.py apply-issue-sync --plan <plan> --updates-file "$UPDATES"
+   rm -f "$UPDATES"
    ```
 
 ---

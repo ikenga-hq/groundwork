@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import sys
 import tempfile
 
@@ -61,7 +62,7 @@ def _html_script_escape(s: str) -> str:
     to mock) and inject live HTML (XSS). Each replacement is a valid JSON \\u escape,
     so JSON.parse round-trips it back to the original character in the app."""
     return (s.replace("&", "\\u0026").replace("<", "\\u003c").replace(">", "\\u003e")
-             .replace(chr(0x2028), "\u2028").replace(chr(0x2029), "\u2029"))
+             .replace(chr(0x2028), "\\u2028").replace(chr(0x2029), "\\u2029"))
 
 
 def sha256_text(s: str) -> str:
@@ -84,16 +85,93 @@ def read_file(path: str) -> str:
         return f.read()
 
 
+def read_file_raw(path: str) -> str:
+    """Like read_file but keeps CRLF / lone-CR bytes as they are on disk. Used by
+    every path that rewrites a doc, so line endings outside the edit survive."""
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def _new_file_mode() -> int:
+    m = os.umask(0)
+    os.umask(m)
+    return 0o666 & ~m
+
+
+def dest_mode(path: str) -> int:
+    """Mode a freshly replaced file should end up with: the existing regular file's
+    mode, else 0o666 & ~umask. mkstemp creates 0600, which os.replace would carry
+    onto the target (breaking files served to another user, or a shared group)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return _new_file_mode()
+    return stat.S_IMODE(st.st_mode) if stat.S_ISREG(st.st_mode) else _new_file_mode()
+
+
 def atomic_write(path: str, data: str) -> None:
     d = os.path.dirname(os.path.abspath(path)) or "."
     fd, tmp = tempfile.mkstemp(dir=d, prefix=".gw-tmp-")
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(data)
+        os.chmod(tmp, dest_mode(path))
         os.replace(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.remove(tmp)
+
+
+# --------------------------------------------------------------------------- #
+# safe reads (confinement to the plan folder, regular files only, capped)
+# --------------------------------------------------------------------------- #
+
+_DOC_READ_CAP = 8 * 1024 * 1024  # anchor-listed docs: generous, but never unbounded
+
+
+def _under_root(root_real: str, path_real: str) -> bool:
+    try:
+        return os.path.commonpath([root_real, path_real]) == root_real
+    except ValueError:  # different drives / mix of abs+rel
+        return False
+
+
+def resolve_in_plan(plan: str, rel: str):
+    """Resolve `rel` (a path taken from the anchor or a directory walk) against
+    the plan folder. Returns the realpath, or None when it escapes
+    realpath(plan) (absolute key, `..`, or a symlink pointing outside)."""
+    if not isinstance(rel, str) or not rel or "\0" in rel:
+        return None
+    root = os.path.realpath(plan)
+    real = os.path.realpath(os.path.join(root, rel))
+    return real if _under_root(root, real) else None
+
+
+def read_regular_capped(path: str, cap: int):
+    """Read at most cap+1 bytes from a regular file, never following a symlink
+    at the final component and never blocking on a FIFO/device. Returns the raw
+    bytes (len == cap+1 means 'over the cap'), or None if `path` is not a
+    readable regular file. Never trusts stat().st_size."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        chunks, total = [], 0
+        while total <= cap:
+            b = os.read(fd, min(1 << 20, cap + 1 - total))
+            if not b:
+                break
+            chunks.append(b)
+            total += len(b)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -104,14 +182,51 @@ def anchor_path(plan: str) -> str:
     return os.path.join(plan, ANCHOR)
 
 
+# Real anchors are tens of KB. The cap keeps a hostile / runaway anchor from being
+# slurped whole (and then embedded whole) by every generator run.
+_ANCHOR_READ_CAP = 4 * 1024 * 1024
+_ANCHOR_OBJECT_KEYS = ("docs", "ids", "designs", "subplans", "research", "milestones")
+
+
+def anchor_shape_error(a):
+    """Why `a` can't be used as an anchor (None when it can). Valid JSON that is not
+    an object, or whose container keys are not objects, would otherwise surface as
+    an AttributeError deep inside a command."""
+    if not isinstance(a, dict):
+        return "top level is not a JSON object"
+    for k in _ANCHOR_OBJECT_KEYS:
+        if k in a and not isinstance(a[k], dict):
+            return f'"{k}" is not an object'
+    if "profile" in a and not isinstance(a["profile"], str):
+        return '"profile" is not a string'
+    return None
+
+
+def parse_anchor(path: str):
+    """Capped, shape-checked read of an anchor file -> (anchor, error)."""
+    raw = read_regular_capped(path, _ANCHOR_READ_CAP)
+    if raw is None:
+        return None, f"{ANCHOR} is not a readable regular file"
+    if len(raw) > _ANCHOR_READ_CAP:
+        return None, f"{ANCHOR} is larger than {_ANCHOR_READ_CAP // (1024 * 1024)} MB"
+    try:
+        a = json.loads(raw.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"{ANCHOR} is corrupt JSON ({e}); restore from git."
+    bad = anchor_shape_error(a)
+    if bad:
+        return None, f"{ANCHOR} is malformed ({bad}); restore from git."
+    return a, None
+
+
 def load_anchor(plan: str) -> dict:
     p = anchor_path(plan)
     if not os.path.exists(p):
         die(f"not a groundwork plan folder (no {ANCHOR}); run `groundwork init` first.", 2)
-    try:
-        return json.loads(read_file(p))
-    except json.JSONDecodeError as e:
-        die(f"{ANCHOR} is corrupt JSON ({e}); restore from git.", 2)
+    a, err = parse_anchor(p)
+    if err:
+        die(err, 2)
+    return a
 
 
 def save_anchor(plan: str, anchor: dict) -> None:
@@ -123,18 +238,79 @@ def save_anchor(plan: str, anchor: dict) -> None:
 # fence parsing
 # --------------------------------------------------------------------------- #
 
-# Recognize markdown (<!-- -->), // and # line-comment fence variants.
-def _fence_patterns(fence_id: str):
-    esc = re.escape(fence_id)
-    start = re.compile(
-        rf"^[ \t]*(?:<!--|//|#)[ \t]*groundwork:auto:start[ \t]+{esc}[ \t]*(?:-->)?[ \t]*$",
-        re.M,
-    )
-    end = re.compile(
-        rf"^[ \t]*(?:<!--|//|#)[ \t]*groundwork:auto:end[ \t]+{esc}[ \t]*(?:-->)?[ \t]*$",
-        re.M,
-    )
-    return start, end
+class FenceError(ValueError):
+    """The fence markers in a file are malformed (duplicate, nested, overlapping,
+    unterminated or orphaned). Callers refuse / report instead of guessing."""
+
+
+# Recognize markdown (<!-- -->), // and # line-comment fence variants. A trailing
+# \r is tolerated so CRLF files parse; spans never include it.
+_MARKER_RE = re.compile(
+    r"^[ \t]*(?:<!--|//|#)[ \t]*groundwork:auto:(start|end)[ \t]+(\S+?)[ \t]*(?:-->)?[ \t\r]*$"
+)
+# Any line that *looks* like a fence marker, whatever its id: write paths refuse these.
+_ANY_MARKER_RE = re.compile(r"^[ \t]*(?:<!--|//|#)[ \t]*groundwork:auto:(?:start|end)\b")
+_CODE_OPEN_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_MD_EXTS = (".md", ".markdown", ".mdx")
+
+
+def is_md(path: str) -> bool:
+    return str(path).lower().endswith(_MD_EXTS)
+
+
+def scan_fences(text: str, md: bool = False):
+    """Walk `text` once and return ({id: (start_span, end_span, inner)}, [errors]).
+
+    For markdown (`md=True`) lines inside a ``` / ~~~ code block are not markers, so a
+    note that quotes the fence syntax can't masquerade as a region. Each id must have
+    exactly one start and one matching end, and regions must not nest or overlap."""
+    regions, errors, seen = {}, [], set()
+    open_ = None  # (id, start_span)
+    code = None   # (char, length) of the open code block
+    swallowed = []  # fence-looking lines seen inside the open code block
+    for m in re.finditer(r"[^\n]*\n|[^\n]+", text):
+        raw = m.group(0)
+        line = raw[:-1] if raw.endswith("\n") else raw
+        body = line.rstrip("\r")
+        if md:
+            if code:
+                if re.match(r"^ {0,3}" + re.escape(code[0]) + "{" + str(code[1]) + r",}[ \t]*$", body):
+                    code, swallowed = None, []
+                elif _ANY_MARKER_RE.match(body):
+                    swallowed.append(body.strip())
+                continue
+            co = _CODE_OPEN_RE.match(body)
+            if co:
+                code = (co.group(1)[0], len(co.group(1)))
+                continue
+        mm = _MARKER_RE.match(line)
+        if not mm:
+            continue
+        kind, fid = mm.group(1), mm.group(2)
+        span = (m.start(), m.start() + len(body))
+        if kind == "start":
+            if fid in seen:
+                errors.append(f"duplicate start fence for '{fid}'")
+            elif open_ is not None:
+                errors.append(f"fence '{fid}' starts inside the still-open fence '{open_[0]}' (nested or overlapping)")
+            else:
+                open_ = (fid, span)
+            seen.add(fid)
+        else:
+            if open_ is None:
+                errors.append(f"end fence '{fid}' has no start")
+            elif open_[0] != fid:
+                errors.append(f"end fence '{fid}' closes inside the open fence '{open_[0]}' (overlapping)")
+                open_ = None
+            else:
+                regions[fid] = (open_[1], span, text[open_[1][1]:span[0]])
+                open_ = None
+    if open_ is not None:
+        errors.append(f"unterminated start fence '{open_[0]}'")
+    if code and swallowed:
+        # an unclosed code block would hide these markers (and so their regions)
+        errors.append(f"unclosed code block hides {len(swallowed)} fence marker line(s), e.g. '{swallowed[0]}'")
+    return regions, errors
 
 
 _META_RE = re.compile(
@@ -143,8 +319,10 @@ _META_RE = re.compile(
 
 
 def _strip_meta(body: str) -> str:
-    """Drop a single leading `last_action:` metadata line, then trim."""
-    lines = body.splitlines()
+    """Drop a single leading `last_action:` metadata line, then trim. Splits on \n
+    only (str.splitlines also breaks on U+2028, \x0c, \x85 ... and the re-join would
+    silently rewrite them) and ignores CR, so a CRLF file hashes like its LF twin."""
+    lines = body.replace("\r\n", "\n").split("\n")
     # skip leading blank lines
     i = 0
     while i < len(lines) and lines[i].strip() == "":
@@ -154,26 +332,65 @@ def _strip_meta(body: str) -> str:
     return "\n".join(lines[i:]).strip("\n").strip()
 
 
-def find_region(text: str, fence_id: str):
+def body_hash(content: str) -> str:
+    """Hash of `content` exactly as a read-back of the region will hash it, i.e. the
+    same normalization the on-disk side goes through (meta line dropped, trimmed)."""
+    return sha256_text(_strip_meta("<!-- last_action: x -->\n" + content))
+
+
+def find_region(text: str, fence_id: str, md: bool = False):
     """Return (start_span, end_span, inner_body) or None. inner_body is the raw text
-    between the fence comment lines (newline-delimited, fences excluded)."""
-    s_re, e_re = _fence_patterns(fence_id)
-    sm = s_re.search(text)
-    if not sm:
-        return None
-    em = e_re.search(text, sm.end())
-    if not em:
-        return None
-    inner = text[sm.end():em.start()]
-    return (sm.start(), sm.end()), (em.start(), em.end()), inner
+    between the fence comment lines (newline-delimited, fences excluded). Raises
+    FenceError when the file's fences are malformed."""
+    regions, errors = scan_fences(text, md)
+    if errors:
+        raise FenceError("; ".join(errors))
+    return regions.get(fence_id)
 
 
-def region_content_hash(text: str, fence_id: str):
-    r = find_region(text, fence_id)
+def region_content_hash(text: str, fence_id: str, md: bool = False):
+    r = find_region(text, fence_id, md)
     if r is None:
         return None
     _, _, inner = r
     return sha256_text(_strip_meta(inner))
+
+
+def _file_nl(text: str) -> str:
+    """The newline a file uses (CRLF when it does so more than LF-only)."""
+    crlf = text.count("\r\n")
+    return "\r\n" if crlf and crlf * 2 > text.count("\n") else "\n"
+
+
+def _with_nl(s: str, nl: str) -> str:
+    s = s.replace("\r\n", "\n")
+    return s.replace("\n", nl) if nl != "\n" else s
+
+
+def _refuse_marker_lines(content: str, what: str) -> None:
+    """Content spliced into a region must not itself contain a fence marker: an end
+    marker truncates the region, a start marker captures the next one."""
+    for n, line in enumerate(re.split(r"\r\n|\r|\n", content), 1):
+        if _ANY_MARKER_RE.match(line):
+            die(f"{what}: content line {n} is a groundwork:auto fence marker; refusing to write it "
+                f"into a region (it would corrupt the fence structure). Reword or remove that line.", 1)
+
+
+def _region_or_die(text: str, fid: str, md: bool, label: str):
+    try:
+        r = find_region(text, fid, md)
+    except FenceError as e:
+        die(f"{label}: malformed fences ({e}); fix the markers by hand first.", 1)
+    if r is None:
+        die(f"fence '{fid}' not found in {label}", 1)
+    return r
+
+
+def _check_fences_after(new_text: str, md: bool, label: str) -> None:
+    _, errors = scan_fences(new_text, md)
+    if errors:
+        die(f"{label}: refusing the write, it would leave the fences malformed ({'; '.join(errors)}) "
+            f"- e.g. content with an unbalanced ``` code block.", 1)
 
 
 # --------------------------------------------------------------------------- #
@@ -416,34 +633,104 @@ def cmd_read_anchor(args):
 # command: scaffold
 # --------------------------------------------------------------------------- #
 
-def _record_doc(anchor: dict, plan: str, relpath: str, fence_ids, action: str):
-    """Record a doc's whole-file hash + region hashes. Preserves the existing
-    region entry (including its last_written stamp) when the content hash is
-    unchanged, so re-recording an untouched doc produces no diff — the basis of
-    scaffold idempotency."""
+def _record_doc(anchor: dict, plan: str, relpath: str, fence_ids, action: str,
+                rewritten=()):
+    """Record a doc's whole-file hash + region hashes. A region this run did not
+    write (`rewritten`) keeps its prior entry verbatim, stamp and all: only a write
+    moves a region's baseline, so re-running `init` over a hand-edited fence can't
+    quietly bless the edit as clean. An unrecorded region is baselined from disk."""
     full = os.path.join(plan, relpath)
-    text = read_file(full)
+    text = read_file_raw(full)
     prior = {r["id"]: r for r in anchor.get("docs", {}).get(relpath, {}).get("generated_regions", [])}
     regions = []
-    for fid in fence_ids:
-        h = region_content_hash(text, fid)
-        if h is None:
-            continue
-        old = prior.get(fid)
-        if old and old.get("hash") == h:
-            regions.append(old)  # unchanged — keep the original stamp
-        else:
-            regions.append({"id": fid, "hash": h, "last_action": action, "last_written": _now()})
+    scanned, errs = scan_fences(text, is_md(relpath))
+    if errs:
+        # can't tell what is on disk; keep every prior record so status can say so
+        regions = [prior[f] for f in fence_ids if f in prior]
+    else:
+        for fid in fence_ids:
+            r = scanned.get(fid)
+            if r is None:
+                if fid in prior:
+                    regions.append(prior[fid])  # not visible on disk - never drop its baseline
+                continue
+            h = sha256_text(_strip_meta(r[2]))
+            old = prior.get(fid)
+            if old and fid not in rewritten:
+                regions.append(old)  # not written by this run - the baseline stays
+            elif old and old.get("hash") == h:
+                regions.append(old)  # unchanged - keep the original stamp
+            else:
+                regions.append({"id": fid, "hash": h, "last_action": action, "last_written": _now()})
     anchor.setdefault("docs", {})[relpath] = {
         "hash": sha256_text(text),
         "generated_regions": regions,
     }
 
 
+def _load_anchor_or_none(plan: str):
+    """Like load_anchor but returns None when the anchor is missing, unreadable,
+    oversized or not a usable JSON object (so --force can recreate only a *corrupt*
+    anchor)."""
+    p = anchor_path(plan)
+    if not os.path.exists(p):
+        return None
+    a, _err = parse_anchor(p)
+    return a
+
+
+def _rerender_fences(plan: str, relpath: str, rendered: str, fence_ids, anchor: dict):
+    """Re-render only the fence interiors of an existing file from the rendered
+    template, leaving every byte outside the fences alone. A region is skipped
+    when it was last written by an action other than init (generated content),
+    or when it looks hand-edited (on-disk hash differs from what we last wrote, or
+    there is no record and it differs from the fresh render) - same dirty
+    semantics as write-region, minus the per-call --force override. A file whose
+    fences are malformed is left untouched and every region reported dirty.
+    Returns (refreshed_ids, dirty_ids, missing_ids, malformed_error_or_None)."""
+    full = os.path.join(plan, relpath)
+    text = read_file_raw(full)
+    md = is_md(relpath)
+    nl = _file_nl(text)
+    prior = {r["id"]: r for r in anchor.get("docs", {}).get(relpath, {}).get("generated_regions", [])}
+    refreshed, dirty, missing = [], [], []
+    errs = scan_fences(text, md)[1] or scan_fences(rendered, md)[1]
+    if errs:
+        return [], list(fence_ids), [], "; ".join(errs)
+    for fid in fence_ids:
+        cur = find_region(text, fid, md)
+        new = find_region(rendered, fid, md)
+        if cur is None or new is None:
+            missing.append(fid)
+            continue
+        (_, cs1), (ce0, _), cinner = cur
+        _, _, ninner = new
+        on_disk = sha256_text(_strip_meta(cinner))
+        fresh = sha256_text(_strip_meta(ninner))
+        rec = prior.get(fid)
+        if on_disk == fresh:
+            continue  # already identical - nothing to do
+        if (rec and on_disk != rec.get("hash")) or (not rec):
+            dirty.append(fid)
+            continue
+        if rec.get("last_action") != "init":
+            # last written by another action (research, orchestrate, ...): that
+            # is generated content, not a blank template. Never reset it.
+            dirty.append(fid)
+            continue
+        text = text[:cs1] + _with_nl(ninner, nl) + text[ce0:]
+        refreshed.append(fid)
+    if refreshed:
+        atomic_write(full, text)
+    return refreshed, dirty, missing, None
+
+
 def cmd_scaffold(args):
     plan = args.plan
     root = args.profiles_root
     plan_slug = os.path.basename(os.path.normpath(plan))
+    reset_all = getattr(args, "reset_all", False)
+    force = args.force or reset_all
 
     # conformance gate before touching disk (rules 1-9 hard)
     v = validate_profile(root, args.profile)
@@ -454,8 +741,16 @@ def cmd_scaffold(args):
     subs = build_subs(profile, args.goal, plan_slug)
 
     existing_anchor = os.path.exists(anchor_path(plan))
-    if existing_anchor and not args.force:
-        anchor = load_anchor(plan)
+    if reset_all:
+        anchor = _new_anchor(args.profile, args.goal)  # destroys ids/designs/subplans/research
+    elif existing_anchor:
+        # --force keeps the anchor's ids/designs/subplans/research; only a corrupt
+        # (or non-object) anchor is recreated, and only when --force was passed.
+        anchor = _load_anchor_or_none(plan)
+        if anchor is None:
+            if not force:
+                load_anchor(plan)  # dies with the standard corrupt-JSON message
+            anchor = _new_anchor(args.profile, args.goal)
     else:
         anchor = _new_anchor(args.profile, args.goal)
     # snapshot for true-no-op detection (everything except the volatile `updated`)
@@ -463,15 +758,36 @@ def cmd_scaffold(args):
 
     os.makedirs(plan, exist_ok=True)
     written, skipped = [], []
+    refreshed_regions, dirty_regions, missing_regions, malformed_fences = [], [], [], []
+
+    def _place(relpath, tpl, dest):
+        """Write a missing file; with --reset-all overwrite; with --force on an
+        existing file re-render fence interiors only. Returns the region ids this
+        run rewrote - only those get a new baseline in the anchor."""
+        if not os.path.exists(dest) or reset_all:
+            atomic_write(dest, render_template(read_file(tpl), subs))
+            written.append(relpath)
+            return tuple(SCAFFOLD_REGIONS.get(relpath, []))
+        skipped.append(relpath)
+        if not args.force:
+            return ()
+        ids = SCAFFOLD_REGIONS.get(relpath, [])
+        if not ids:
+            return ()
+        rendered = render_template(read_file(tpl), subs)
+        ref, dirty, miss, bad = _rerender_fences(plan, relpath, rendered, ids, anchor)
+        refreshed_regions.extend(f"{relpath}#{i}" for i in ref)
+        dirty_regions.extend(f"{relpath}#{i}" for i in dirty)
+        missing_regions.extend(f"{relpath}#{i}" for i in miss)
+        if bad:
+            malformed_fences.append({"file": relpath, "error": bad})
+        return tuple(ref)
+
     for fname in profile["spine"]:
         dest = os.path.join(plan, fname)
-        if os.path.exists(dest) and not args.force:
-            skipped.append(fname)
-        else:
-            tpl = template_path(root, profile, fname)
-            atomic_write(dest, render_template(read_file(tpl), subs))
-            written.append(fname)
-        _record_doc(anchor, plan, fname, SCAFFOLD_REGIONS.get(fname, []), "init")
+        tpl = template_path(root, profile, fname)
+        rewrote = _place(fname, tpl, dest)
+        _record_doc(anchor, plan, fname, SCAFFOLD_REGIONS.get(fname, []), "init", rewrote)
 
     # designs/ + drafts/ (cheap dirs)
     os.makedirs(os.path.join(plan, "designs"), exist_ok=True)
@@ -485,9 +801,9 @@ def cmd_scaffold(args):
         atomic_write(drafts_dest, render_template(read_file(drafts_tpl), subs))
         written.append("drafts/README.md")
 
-    # artifact/ — living-spec index.html + ikenga manifest. Written only if absent
-    # (hand-edited overlays are preserved); the spec-state fence inside index.html
-    # starts as an empty scaffold and is regenerated by `refresh-living-spec`.
+    # artifact/ - living-spec index.html + ikenga manifest. Written only if absent
+    # (hand-edited overlays are preserved); with --force only the spec-state fence
+    # interior is re-rendered. The fence is regenerated by `refresh-living-spec`.
     artifact_dir = os.path.join(plan, "artifact")
     os.makedirs(artifact_dir, exist_ok=True)
     for relpath in SCAFFOLD_ARTIFACT_FILES:
@@ -495,24 +811,26 @@ def cmd_scaffold(args):
         dest = os.path.join(plan, relpath)
         if not os.path.exists(tpl):
             continue
-        if os.path.exists(dest) and not args.force:
-            skipped.append(relpath)
-        else:
-            atomic_write(dest, render_template(read_file(tpl), subs))
-            written.append(relpath)
+        rewrote = _place(relpath, tpl, dest)
         # Only record region hashes for files we know carry a fence.
         regions = SCAFFOLD_REGIONS.get(relpath, [])
         if regions:
-            _record_doc(anchor, plan, relpath, regions, "init")
+            _record_doc(anchor, plan, relpath, regions, "init", rewrote)
 
     after = json.dumps({k: v for k, v in anchor.items() if k != "updated"}, sort_keys=True)
     changed = (not existing_anchor) or (before != after) or bool(written)
     if changed:
         save_anchor(plan, anchor)  # bumps `updated`
-    # else: true no-op — leave the anchor (and its `updated`) untouched
-    emit({"result": "scaffolded" if not existing_anchor else ("reconciled" if changed else "unchanged"),
-          "plan": plan, "profile": args.profile, "spine_version": CURRENT_SPINE_VERSION,
-          "written": written, "skipped_existing": skipped})
+    # else: true no-op - leave the anchor (and its `updated`) untouched
+    out = {"result": "scaffolded" if not existing_anchor else ("reconciled" if changed else "unchanged"),
+           "plan": plan, "profile": args.profile, "spine_version": CURRENT_SPINE_VERSION,
+           "written": written, "skipped_existing": skipped}
+    if force:
+        out["refreshed_regions"] = refreshed_regions
+        out["skipped_dirty_regions"] = dirty_regions
+        out["missing_fences"] = missing_regions
+        out["malformed_fences"] = malformed_fences
+    emit(out)
 
 
 # --------------------------------------------------------------------------- #
@@ -520,9 +838,7 @@ def cmd_scaffold(args):
 # --------------------------------------------------------------------------- #
 
 def cmd_read_region(args):
-    r = find_region(read_file(args.file), args.id)
-    if r is None:
-        die(f"fence '{args.id}' not found in {args.file}", 1)
+    r = _region_or_die(read_file(args.file), args.id, is_md(args.file), args.file)
     _, _, inner = r
     sys.stdout.write(_strip_meta(inner) + "\n")
 
@@ -535,14 +851,28 @@ def cmd_write_region(args):
     action = args.action
     new_content = args.content if args.content is not None else read_file(args.content_file)
     new_content = new_content.strip("\n")
-    if getattr(args, "html_script_safe", False):
+    wrap_id = getattr(args, "wrap_script", None)
+    if wrap_id:
+        # The fence owns the whole <script> element (living spec: spec-state).
+        # The caller supplies bare JSON; we validate it, escape it and add the tags,
+        # so plan text containing `</script>` can never close the element early.
+        wtype = getattr(args, "wrap_script_type", None) or "application/groundwork+json"
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]+", wrap_id) or not re.fullmatch(r"[A-Za-z0-9_.+/-]+", wtype):
+            die("--wrap-script / --wrap-script-type contain unsafe characters", 1)
+        try:
+            json.loads(new_content)
+        except ValueError as e:
+            die(f"--wrap-script content must be bare JSON ({e})", 1)
+        new_content = (f'<script type="{wtype}" id="{wrap_id}">'
+                       f'{_html_script_escape(new_content)}</script>')
+    elif getattr(args, "html_script_safe", False):
         new_content = _html_script_escape(new_content)
-    new_hash = sha256_text(new_content.strip())
+    _refuse_marker_lines(new_content, relpath)
+    new_hash = body_hash(new_content)
 
-    text = read_file(full)
-    r = find_region(text, fid)
-    if r is None:
-        die(f"fence '{fid}' not found in {relpath}", 1)
+    text = read_file_raw(full)
+    md = is_md(relpath)
+    r = _region_or_die(text, fid, md, relpath)
     (s0, s1), (e0, e1), inner = r
 
     anchor = load_anchor(plan)
@@ -569,8 +899,10 @@ def cmd_write_region(args):
     else:
         meta = f"<!-- last_action: {action} · {_now()} -->"
 
-    new_inner = f"\n{meta}\n{new_content}\n"
+    nl = _file_nl(text)
+    new_inner = f"{nl}{meta}{nl}{_with_nl(new_content, nl)}{nl}"
     new_text = text[:s1] + new_inner + text[e0:]
+    _check_fences_after(new_text, md, relpath)
     atomic_write(full, new_text)
 
     # update anchor
@@ -633,6 +965,9 @@ def cmd_register_subplan(args):
           "entry": anchor["subplans"][args.file]})
 
 
+TIERS = ("opus", "sonnet", "haiku")  # lib/schemas.md §"Model tiers"
+
+
 def cmd_register_id(args):
     anchor = load_anchor(args.plan)
     ids = anchor.setdefault("ids", {})
@@ -645,7 +980,12 @@ def cmd_register_id(args):
         try:
             v = json.loads(v)
         except json.JSONDecodeError:
-            pass
+            # `[WP-01,WP-02]` (unquoted IDs) isn't JSON but is plainly a list — store it as one.
+            s = v.strip()
+            if len(s) >= 2 and s[0] == "[" and s[-1] == "]":
+                v = [x.strip().strip("\"'") for x in s[1:-1].split(",") if x.strip().strip("\"'")]
+        if k == "tier" and v not in TIERS:
+            die(f"--field tier must be one of {', '.join(TIERS)} (got {v!r})", 1)
         entry[k] = v
     ids[args.id] = entry
     save_anchor(args.plan, anchor)
@@ -719,7 +1059,7 @@ def cmd_issue_sync_data(args):
     children_map = {}
     for k, v in ids.items():
         if k.startswith("WP-"):
-            for dep in v.get("depends_on", []):
+            for dep in _as_id_list(v.get("depends_on")):  # tolerates the legacy "[WP-01]" string
                 if dep.startswith("WP-"):
                     children_map.setdefault(dep, []).append(k)
 
@@ -754,7 +1094,7 @@ def cmd_issue_sync_data(args):
                 "wave": v.get("wave"),
                 "phase": v.get("phase", f"P{v.get('wave', 0) + 1}"),
                 "tier": v.get("tier"),
-                "depends_on": v.get("depends_on", []),
+                "depends_on": _as_id_list(v.get("depends_on")),
                 "gate": v.get("gate"),
                 "brief": briefs.get(k, ""),
                 "issue": v.get("issue"),
@@ -819,8 +1159,519 @@ def cmd_apply_issue_sync(args):
 
 
 # --------------------------------------------------------------------------- #
+# design lifecycle — ids[D-NN] is canonical; designs[<path>] are its variant files
+# --------------------------------------------------------------------------- #
+#
+# One model: `ids[D-NN]` is the design (a surface or decision — it can exist before
+# any mockup file). `designs[<path>]` registers each variant file and links back with
+# `design: "D-NN"`; its `locked`/`locked_in` are a mirror kept for older readers.
+# Lifecycle state (design_state, build_state) is DERIVED on every read, never stored.
+# Legacy anchors (unlinked `designs[path]` locks, D-NN with no files) are tolerated.
+
+_D_ID_RE = re.compile(r"^D-\d+[a-z]?$")
+# A design token at the start of a filename: `d-01-identity.html`, `D-3.html`, `d07_x.html`.
+_D_FILE_TOKEN_RE = re.compile(r"^d-?(\d{1,3})(?=[-_.])", re.I)
+_CLOSED_FINDING = {"folded", "resolved", "retired", "closed", "wontfix"}
+
+
+def _round_label(r) -> str:
+    m = re.fullmatch(r"(?:round\s*)?(\d+)", str(r).strip(), re.I)
+    if not m:
+        die(f"--round expects a round number (e.g. 5 or 'Round 5'), got {r!r}", 1)
+    return f"Round {int(m.group(1))}"
+
+
+def _as_id_list(v) -> list:
+    """Tolerate a JSON list or the legacy string forms `[D-01,D-02]` / `D-01, D-02`
+    (register-id stores `--field k=[A,B]` as a string because it isn't valid JSON)."""
+    if isinstance(v, list):
+        return [str(x) for x in v]
+    if isinstance(v, str):
+        parts = [x.strip().strip("\"'") for x in v.strip().strip("[]").split(",")]
+        return [x for x in parts if x and x.lower() != "none"]
+    return []
+
+
+def _id_sort_key(k: str):
+    m = re.match(r"^[A-Z]+-(\d+)([a-z]?)", k)
+    return (0, int(m.group(1)), m.group(2)) if m else (1, 0, k)
+
+
+def _norm_rel(p: str) -> str:
+    p = p.replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _design_ids(anchor: dict) -> list:
+    return sorted((k for k, v in anchor.get("ids", {}).items()
+                   if k.startswith("D-") and isinstance(v, dict)), key=_id_sort_key)
+
+
+def _design_link(entry):
+    """The D-NN a variant entry links to. `design` is canonical; `id` is read too, because
+    plans adopted that spelling before the lifecycle commands existed."""
+    if not isinstance(entry, dict):
+        return None
+    for key in ("design", "id"):
+        v = entry.get(key)
+        if isinstance(v, str) and _D_ID_RE.match(v):
+            return v
+    return None
+
+
+def _design_files(anchor: dict, did: str) -> list:
+    """Variant files linked to a design, from either side of the link."""
+    e = anchor.get("ids", {}).get(did, {})
+    files = [_norm_rel(p) for p in _as_id_list(e.get("files"))]
+    for p, d in (anchor.get("designs") or {}).items():
+        if _design_link(d) == did and p not in files:
+            files.append(p)
+    return files
+
+
+def _design_token_id(anchor: dict, path: str):
+    """`designs/d-01-identity.html` → `D-01` if a design with that number is registered."""
+    m = _D_FILE_TOKEN_RE.match(os.path.basename(path))
+    if not m:
+        return None
+    n = int(m.group(1))
+    for did in _design_ids(anchor):
+        dm = re.match(r"^D-(\d+)$", did)
+        if dm and int(dm.group(1)) == n:
+            return did
+    return None
+
+
+def _effective_lock(anchor: dict, did: str):
+    """(locked, locked_files, locked_in). The ID's own fields win. Two legacy shapes are
+    read through: a lock recorded only on linked variants (`designs[p].locked`), and a lock
+    recorded on the ID by hand with no file named — its locked files are then the linked
+    variants that carry `locked: true`."""
+    e = anchor.get("ids", {}).get(did, {})
+    designs = anchor.get("designs") or {}
+    mirrored = [p for p in _design_files(anchor, did)
+                if isinstance(designs.get(p), dict) and designs[p].get("locked")]
+    mirror_in = designs[mirrored[0]].get("locked_in") if mirrored else None
+    if "locked" not in e:
+        return bool(mirrored), mirrored, mirror_in
+    if not e.get("locked"):
+        return False, [], None
+    files = _as_id_list(e.get("locked_files")) or ([e["locked_file"]] if e.get("locked_file") else mirrored)
+    return True, files, e.get("locked_in") or mirror_in
+
+
+def _link_design_file(anchor: dict, did: str, rel: str) -> None:
+    designs = anchor.setdefault("designs", {})
+    entry = designs.get(rel)
+    if not isinstance(entry, dict):
+        entry = {"phase": None, "wp": None, "locked": False, "pane_ids": None}
+        designs[rel] = entry
+    entry["design"] = did
+    e = anchor["ids"][did]
+    files = _as_id_list(e.get("files"))
+    if rel not in files:
+        files.append(rel)
+    e["files"] = files
+    if not entry.get("phase") and e.get("phase"):
+        entry["phase"] = e["phase"]
+
+
+def _design_lifecycle(anchor: dict, plan: str | None = None) -> dict:
+    """The derived design model: one entry per D-NN plus unlinked variant files and
+    per-phase coverage. build_state comes from implementing WPs (`ids[WP].implements`)
+    and their PR records (`ids[WP].prs[]`); verified needs an explicit `verified_in`."""
+    ids = anchor.get("ids", {})
+    designs = anchor.get("designs") or {}
+    wp_ids = sorted((k for k, v in ids.items() if k.startswith("WP-") and isinstance(v, dict)),
+                    key=_id_sort_key)
+    gap_ids = sorted((k for k, v in ids.items() if k.startswith("G-") and isinstance(v, dict)
+                      and v.get("kind") != "freeze_gate"), key=_id_sort_key)
+    out, linked = [], set()
+    for did in _design_ids(anchor):
+        e = ids[did]
+        files = _design_files(anchor, did)
+        linked.update(files)
+        locked, locked_files, locked_in = _effective_lock(anchor, did)
+        locked_file = locked_files[0] if locked_files else None
+        phase = e.get("phase") or next((designs[p].get("phase") for p in files
+                                        if isinstance(designs.get(p), dict) and designs[p].get("phase")), None)
+        wps = [{"id": w, "title": ids[w].get("title", ""), "status": ids[w].get("status", "queued")}
+               for w in wp_ids if did in _as_id_list(ids[w].get("implements"))]
+        prs = [{"wp": w, "number": pr.get("number"), "url": pr.get("url"), "state": pr.get("state", "open")}
+               for w in wp_ids for pr in (ids[w].get("prs") or [])
+               if isinstance(pr, dict) and did in _as_id_list(pr.get("designs"))]
+        pr_states = {p["state"] for p in prs}
+        wp_states = [w["status"] for w in wps]
+        if "merged" in pr_states or (wp_states and all(s == "done" for s in wp_states)):
+            build = "implemented"
+        elif "open" in pr_states or any(s in ("in_progress", "done") for s in wp_states):
+            build = "in_progress"
+        else:
+            build = "unbuilt"
+        verified_in = e.get("verified_in")
+        if build == "implemented" and locked and verified_in:
+            build = "verified"
+        warnings = []
+        if build != "unbuilt" and not locked:
+            warnings.append("built against an unlocked design")
+        if locked and not locked_file:
+            warnings.append("locked without a design file")
+        for lf in (locked_files if plan else []):
+            if not os.path.exists(os.path.join(plan, lf)):
+                warnings.append(f"locked file missing on disk: {lf}")
+        if verified_in and build != "verified":
+            warnings.append(f"verified in {verified_in} but no longer locked and implemented")
+        findings = [{"id": g, "kind": ids[g].get("kind"), "status": ids[g].get("status", "open"),
+                     "severity": ids[g].get("severity"), "state": ids[g].get("state"),
+                     "location": ids[g].get("location"), "title": ids[g].get("title", "")}
+                    for g in gap_ids if did in _as_id_list(ids[g].get("design"))]
+        out.append({
+            "id": did, "title": e.get("title", ""), "phase": phase, "files": files,
+            "design_state": "locked" if locked else ("drafted" if files else "planned"),
+            "locked": locked, "locked_file": locked_file, "locked_files": locked_files,
+            "locked_in": locked_in, "unlocked_in": e.get("unlocked_in"), "verified_in": verified_in,
+            "build_state": build, "wps": wps, "prs": prs, "findings": findings,
+            "open_findings": sum(1 for f in findings if f["status"] not in _CLOSED_FINDING),
+            "warnings": warnings,
+        })
+    unlinked = []
+    for p, d in sorted(designs.items()):
+        if not isinstance(d, dict) or p in linked:
+            continue
+        u = {"path": p, "phase": d.get("phase"), "wp": d.get("wp"),
+             "locked": bool(d.get("locked")), "locked_in": d.get("locked_in"),
+             "suggested_id": _design_token_id(anchor, p)}
+        if _design_link(d):
+            u["dangling_design"] = _design_link(d)  # links to a D-NN that isn't registered
+        unlinked.append(u)
+
+    cov = {}
+    def _cov(ph):
+        key = ph or "unphased"
+        return cov.setdefault(key, {"phase": key, "designs": 0, "of": 0, "implemented": 0,
+                                    "verified": 0, "unlinked": 0, "unlinked_locked": 0})
+    for d in out:
+        c = _cov(d["phase"])
+        c["of"] += 1
+        c["designs"] += 1 if d["locked"] else 0
+        c["implemented"] += 1 if d["build_state"] in ("implemented", "verified") else 0
+        c["verified"] += 1 if d["build_state"] == "verified" else 0
+    for u in unlinked:
+        c = _cov(u["phase"])
+        c["unlinked"] += 1
+        c["unlinked_locked"] += 1 if u["locked"] else 0
+    for c in cov.values():
+        # Legacy plans (files only, no D-NN) keep the old meaning: ≥1 locked file = covered.
+        c["ok"] = (c["designs"] == c["of"]) if c["of"] else c["unlinked_locked"] > 0
+    coverage = sorted(cov.values(), key=lambda c: (c["phase"] == "unphased", _id_sort_key(c["phase"].replace("P", "P-", 1))))
+
+    summary = {"total": len(out), "unlinked": len(unlinked),
+               "warnings": sum(len(d["warnings"]) for d in out)}
+    for k in ("planned", "drafted", "locked"):
+        summary[k] = sum(1 for d in out if d["design_state"] == k)
+    for k in ("unbuilt", "in_progress", "implemented", "verified"):
+        summary[k] = sum(1 for d in out if d["build_state"] == k)
+    return {"designs": out, "unlinked": unlinked, "coverage": coverage, "summary": summary}
+
+
+def _anchor_snapshot(anchor: dict) -> str:
+    return json.dumps({k: v for k, v in anchor.items() if k != "updated"}, sort_keys=True)
+
+
+def _save_if_changed(plan: str, anchor: dict, before: str) -> bool:
+    """Idempotency for the design commands: a no-op leaves the anchor (and `updated`) untouched."""
+    if _anchor_snapshot(anchor) == before:
+        return False
+    save_anchor(plan, anchor)
+    return True
+
+
+def _require_design(anchor: dict, did: str) -> dict:
+    if not _D_ID_RE.match(did):
+        die(f"{did} is not a design ID (expected D-NN)", 1)
+    e = anchor.get("ids", {}).get(did)
+    if not isinstance(e, dict):
+        die(f"design {did} is not registered; allocate it with `next-id --kind design` then "
+            f"`register-id --id {did} --doc <doc> --field kind=design --field title=<t> --field phase=<P>`", 1)
+    return e
+
+
+def _lifecycle_entry(anchor: dict, plan: str, did: str) -> dict:
+    return next(d for d in _design_lifecycle(anchor, plan)["designs"] if d["id"] == did)
+
+
+def cmd_register_design(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    before = _anchor_snapshot(anchor)
+    rel = _norm_rel(args.file)
+    designs = anchor.setdefault("designs", {})
+    entry = designs.get(rel)
+    if not isinstance(entry, dict):
+        entry = {"phase": None, "wp": None, "locked": False, "pane_ids": None}
+        designs[rel] = entry
+    if args.phase:
+        entry["phase"] = args.phase
+    if args.wp:
+        entry["wp"] = args.wp
+    if args.id:
+        e = _require_design(anchor, args.id)
+        prev = _design_link(entry)
+        if prev and prev != args.id and isinstance(anchor["ids"].get(prev), dict):
+            locked, locked_files, _ = _effective_lock(anchor, prev)
+            if locked and rel in locked_files:
+                die(f"{rel} is a locked file of {prev}; run design-unlock on {prev} before relinking it", 1)
+            pe = anchor["ids"][prev]
+            pe["files"] = [p for p in _as_id_list(pe.get("files")) if p != rel]
+            if entry.get("id") == prev:
+                entry.pop("id")  # a stale alias would keep resolving to the old design
+        if args.phase and not e.get("phase"):
+            e["phase"] = args.phase
+        _link_design_file(anchor, args.id, rel)
+    warnings = [] if os.path.exists(os.path.join(plan, rel)) else [f"{rel} does not exist on disk yet"]
+    changed = _save_if_changed(plan, anchor, before)
+    emit({"result": "REGISTERED" if changed else "UNCHANGED", "file": rel,
+          "design": _design_link(designs[rel]), "entry": designs[rel], "warnings": warnings})
+
+
+def cmd_design_lock(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    before = _anchor_snapshot(anchor)
+    did = args.id
+    e = _require_design(anchor, did)
+    rnd = _round_label(args.round)
+    files = _design_files(anchor, did)
+    locked, cur_files, cur_in = _effective_lock(anchor, did)
+    requested = list(dict.fromkeys(_norm_rel(f) for f in args.file)) if args.file else None
+    if requested is None:
+        if locked:
+            requested = cur_files
+        elif len(files) <= 1:
+            requested = files
+        else:
+            die(f"{did} has {len(files)} variant files ({', '.join(files)}); pass --file "
+                f"(repeatable) to name the locked one(s)", 1)
+
+    if locked:
+        if sorted(cur_files) != sorted(requested):
+            die(f"{did} is locked on {', '.join(cur_files) or '(no file)'} in {cur_in}; run "
+                f"`design-unlock --id {did} --round N --reason ...` before locking a different set of files", 1)
+        # A file-only or hand-rolled lock: lift it onto the ID in canonical form.
+        if (not e.get("locked") or _as_id_list(e.get("locked_files")) != cur_files
+                or e.get("locked_in") != cur_in):
+            e.update({"locked": True, "locked_files": cur_files,
+                      "locked_file": cur_files[0] if cur_files else None, "locked_in": cur_in})
+        changed = _save_if_changed(plan, anchor, before)
+        emit({"result": "NORMALIZED" if changed else "UNCHANGED", "id": did,
+              "locked_files": cur_files, "locked_in": cur_in, "note": f"already locked in {cur_in}"})
+        return
+
+    designs = anchor.get("designs") or {}
+    for rel in requested:
+        owner = _design_link(designs.get(rel))
+        if owner not in (None, did):
+            die(f"{rel} belongs to {owner}, not {did}", 1)
+        if rel not in files:
+            _link_design_file(anchor, did, rel)
+    e.update({"locked": True, "locked_files": requested,
+              "locked_file": requested[0] if requested else None, "locked_in": rnd})
+    e.pop("unlocked_in", None)
+    e.setdefault("history", []).append({"action": "lock", "round": rnd, "files": requested, "at": _now()})
+    for p in _design_files(anchor, did):  # mirror onto the variant registry
+        d = anchor["designs"].get(p)
+        if isinstance(d, dict):
+            d["locked"] = p in requested
+            if p in requested:
+                d["locked_in"] = rnd
+            else:
+                d.pop("locked_in", None)
+    warnings = [] if requested else [f"{did} locked without a design file (spec-only lock)"]
+    warnings += [f"{p} does not exist on disk" for p in requested if not os.path.exists(os.path.join(plan, p))]
+    _save_if_changed(plan, anchor, before)
+    emit({"result": "LOCKED", "id": did, "locked_files": requested,
+          "locked_file": requested[0] if requested else None, "locked_in": rnd, "warnings": warnings})
+
+
+def cmd_design_unlock(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    before = _anchor_snapshot(anchor)
+    did = args.id
+    e = _require_design(anchor, did)
+    rnd = _round_label(args.round)
+    locked, cur_files, cur_in = _effective_lock(anchor, did)
+    if not locked:
+        emit({"result": "UNCHANGED", "id": did, "note": f"{did} is not locked"})
+        return
+    cleared = e.pop("verified_in", None)
+    e.pop("locked_in", None)
+    e.pop("locked_files", None)
+    e.update({"locked": False, "locked_file": None, "unlocked_in": rnd})
+    rec = {"action": "unlock", "round": rnd, "files": cur_files, "was_locked_in": cur_in,
+           "reason": args.reason, "at": _now()}
+    if cleared:
+        rec["cleared_verified_in"] = cleared
+    e.setdefault("history", []).append(rec)
+    for p in cur_files:
+        d = (anchor.get("designs") or {}).get(p)
+        if isinstance(d, dict):
+            d["locked"] = False
+            d.pop("locked_in", None)
+    _save_if_changed(plan, anchor, before)
+    building = [w["id"] for w in _lifecycle_entry(anchor, plan, did)["wps"]]
+    warnings = [f"{', '.join(building)} now build against an unlocked design"] if building else []
+    emit({"result": "UNLOCKED", "id": did, "unlocked_in": rnd, "cleared_verified_in": cleared,
+          "warnings": warnings})
+
+
+def cmd_design_verify(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    before = _anchor_snapshot(anchor)
+    did = args.id
+    e = _require_design(anchor, did)
+    rnd = _round_label(args.round)
+    d = _lifecycle_entry(anchor, plan, did)
+    if e.get("verified_in") == rnd and d["build_state"] == "verified":
+        emit({"result": "UNCHANGED", "id": did, "verified_in": rnd})
+        return
+    if not args.force:
+        if not d["locked"]:
+            die(f"{did} is not locked; lock it before verifying an implementation against it", 1)
+        if d["build_state"] not in ("implemented", "verified"):
+            die(f"{did} build_state is {d['build_state']}; verify once an implementing WP is done or its PR "
+                f"is merged (register-design-impl), or pass --force", 1)
+    e["verified_in"] = rnd
+    rec = {"action": "verify", "round": rnd, "at": _now()}
+    if args.force:
+        rec["forced"] = True
+    e.setdefault("history", []).append(rec)
+    _save_if_changed(plan, anchor, before)
+    emit({"result": "VERIFIED", "id": did, "verified_in": rnd,
+          "build_state": _lifecycle_entry(anchor, plan, did)["build_state"]})
+
+
+def cmd_register_design_impl(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    before = _anchor_snapshot(anchor)
+    ids = anchor.setdefault("ids", {})
+    if not args.wp.startswith("WP-") or not isinstance(ids.get(args.wp), dict):
+        die(f"work package {args.wp} not found in anchor", 1)
+    w = ids[args.wp]
+    declared = _as_id_list(args.designs)
+    for did in declared:
+        _require_design(anchor, did)
+    current = _as_id_list(w.get("implements"))
+    implements = declared if args.replace else current + [d for d in declared if d not in current]
+    if implements or "implements" in w:
+        w["implements"] = implements
+    if args.pr is not None:
+        prs = w.setdefault("prs", [])
+        rec = next((p for p in prs if isinstance(p, dict) and p.get("number") == args.pr), None)
+        if rec is None:
+            rec = {"number": args.pr}
+            prs.append(rec)
+        if args.url:
+            rec["url"] = args.url
+        rec["state"] = args.pr_state or rec.get("state", "open")
+        rec["designs"] = declared
+    warnings = []
+    for did in declared:
+        locked, _, _ = _effective_lock(anchor, did)
+        if not locked:
+            warnings.append(f"{did} is not locked; {args.wp} builds against an unlocked design")
+    changed = _save_if_changed(plan, anchor, before)
+    emit({"result": "REGISTERED" if changed else "UNCHANGED", "wp": args.wp,
+          "implements": w.get("implements", []), "prs": w.get("prs", []), "warnings": warnings})
+
+
+def cmd_design_migrate(args):
+    """Bring a pre-lifecycle anchor forward: link registered design files to D-NN (by an
+    existing `design` field or a `d-NN` filename token), lift legacy file-level locks onto
+    the ID, and report what could not be linked. Never allocates IDs."""
+    plan = args.plan
+    anchor = load_anchor(plan)
+    before = _anchor_snapshot(anchor)
+    ids = anchor.setdefault("ids", {})
+    designs = anchor.setdefault("designs", {})
+    linked, lifted, unmatched, registered = [], [], [], []
+
+    if args.include_unregistered:
+        ddir = os.path.join(plan, "designs")
+        for root, _dirs, fnames in os.walk(ddir) if os.path.isdir(ddir) else []:
+            for fn in sorted(fnames):
+                if not fn.lower().endswith((".html", ".htm")):
+                    continue
+                rel = _norm_rel(os.path.relpath(os.path.join(root, fn), plan))
+                if rel not in designs and _design_token_id(anchor, rel):
+                    designs[rel] = {"phase": None, "wp": None, "locked": False, "pane_ids": None}
+                    registered.append(rel)
+
+    for p in sorted(designs):
+        d = designs[p]
+        if not isinstance(d, dict):
+            continue
+        link = _design_link(d)
+        did = link if isinstance(ids.get(link), dict) else None
+        via = "design field" if did and d.get("design") == did else "id field"
+        if did is None:
+            did, via = _design_token_id(anchor, p), "filename"
+        if did is None:
+            unmatched.append(p)
+            continue
+        if p not in _as_id_list(ids[did].get("files")) or d.get("design") != did:
+            _link_design_file(anchor, did, p)
+            linked.append({"path": p, "id": did, "via": via})
+
+    for did in _design_ids(anchor):
+        e = ids[did]
+        if not e.get("phase"):
+            ph = next((designs[p].get("phase") for p in _design_files(anchor, did)
+                       if isinstance(designs.get(p), dict) and designs[p].get("phase")), None)
+            if ph:
+                e["phase"] = ph
+        locked, lfiles, rin = _effective_lock(anchor, did)
+        if locked and ("locked" not in e or _as_id_list(e.get("locked_files")) != lfiles
+                       or e.get("locked_in") != rin):
+            e.update({"locked": True, "locked_files": lfiles,
+                      "locked_file": lfiles[0] if lfiles else None, "locked_in": rin})
+            if not any(h.get("action") == "lock" for h in e.get("history", []) if isinstance(h, dict)):
+                e.setdefault("history", []).append({"action": "lock", "round": rin, "files": lfiles,
+                                                    "migrated": True})
+            lifted.append(did)
+
+    report = {"linked": linked, "lifted_locks": lifted, "registered_from_disk": registered,
+              "unmatched": unmatched}
+    if args.dry_run:
+        emit({"result": "DRY_RUN", **report})
+        return
+    changed = _save_if_changed(plan, anchor, before)
+    emit({"result": "MIGRATED" if changed else "UNCHANGED", **report})
+
+
+def cmd_design_data(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    emit({"plan": {"title": _plan_title(plan, anchor), "profile": anchor.get("profile"),
+                   "slug": os.path.basename(os.path.normpath(plan))},
+          **_design_lifecycle(anchor, plan)})
+
+
+# --------------------------------------------------------------------------- #
 # command: board-data / status-data
 # --------------------------------------------------------------------------- #
+
+_META_TEXT_CAP = 2048
+
+
+def clip(v, n: int = _META_TEXT_CAP):
+    """Bound a free-text field (goal / title) that gets copied into a generated page."""
+    return v[:n] if isinstance(v, str) else v
+
 
 def _plan_title(plan: str, anchor: dict) -> str:
     f = os.path.join(plan, "01-plan.md")
@@ -835,22 +1686,51 @@ def _extract_wp_briefs(plan: str) -> dict:
     """Parse 09-orchestration.md for `### WP-NN — title` sections; return {WP-NN: brief-body}.
 
     A brief runs from its `### WP-` header to the next `### `/`## ` header or a `---` rule.
-    Returns {} if 09 is absent. Used by `board-data --with-briefs` so the workflow
-    generator can inline each self-contained brief as a string constant at emit time.
+    Headers and rules inside a ``` / ~~~ code block are brief text, not structure, so a
+    quoted `### WP-01` can't replace another WP's brief. When 09 has an `orchestration`
+    fence only its interior is read (the last brief stops at the end marker, hand prose
+    after the fence never becomes part of a sub-agent prompt). A WP header that appears
+    twice is refused (exit 1) rather than letting the last one win.
+    Returns {} if 09 is absent. Used by `board-data --with-briefs` and `emit-workflow` so
+    the workflow generator can inline each self-contained brief as a string constant.
     """
     f = os.path.join(plan, "09-orchestration.md")
     if not os.path.exists(f):
         return {}
-    briefs, cur, buf = {}, None, []
+    text = read_file(f)
+    try:
+        region = find_region(text, "orchestration", True)
+    except FenceError as e:
+        die(f"09-orchestration.md: malformed fences ({e}); fix the markers by hand first.", 1)
+    if region is not None:
+        text = region[2]
+    briefs, seen, cur, buf, code = {}, set(), None, [], None
     hdr = re.compile(r"^### (WP-\d+[a-z]?)(?![\w])")  # letter slices (WP-18a) — \b fails between digit+letter
-    for line in read_file(f).splitlines():
+    for line in text.split("\n"):
+        line = line.rstrip("\r")
+        if code:
+            if re.match(r"^ {0,3}" + re.escape(code[0]) + "{" + str(code[1]) + r",}[ \t]*$", line):
+                code = None
+            if cur is not None:
+                buf.append(line)
+            continue
+        co = _CODE_OPEN_RE.match(line)
+        if co:
+            code = (co.group(1)[0], len(co.group(1)))
+            if cur is not None:
+                buf.append(line)
+            continue
         m = hdr.match(line)
         if m:
             if cur:
                 briefs[cur] = "\n".join(buf).strip()
+            if m.group(1) in seen:
+                die(f"09-orchestration.md: work package {m.group(1)} has more than one `### {m.group(1)}` "
+                    f"section; remove the duplicate.", 1)
+            seen.add(m.group(1))
             cur, buf = m.group(1), [line]
         elif cur is not None:
-            if line.startswith("## ") or re.match(r"^---\s*$", line) or hdr.match(line):
+            if line.startswith("## ") or re.match(r"^---\s*$", line):
                 briefs[cur] = "\n".join(buf).strip()
                 cur, buf = None, []
             else:
@@ -865,29 +1745,142 @@ def cmd_board_data(args):
     anchor = load_anchor(plan)
     ids = anchor.get("ids", {})
     briefs = _extract_wp_briefs(plan) if getattr(args, "with_briefs", False) else {}
-    wps, gates = [], []
+    wps, gates, warnings = [], [], []
     for k, v in ids.items():
         if k.startswith("WP-"):
+            tier = v.get("tier")
+            if tier is not None and tier not in TIERS:
+                warnings.append(f"{k}: invalid tier {tier!r} (expected {', '.join(TIERS)}); reported as null")
+                tier = None
             wp = {"id": k, "title": v.get("title", ""), "wave": v.get("wave"),
-                  "deps": v.get("depends_on", []), "status": v.get("status", "queued"),
-                  "gate": v.get("gate"), "tier": v.get("tier")}
+                  "deps": _as_id_list(v.get("depends_on")), "status": v.get("status", "queued"),
+                  "gate": v.get("gate"), "tier": tier}
             if v.get("issue"):
                 wp["issue"] = v.get("issue")
+            if v.get("implements"):
+                wp["implements"] = _as_id_list(v.get("implements"))
+            if v.get("prs"):
+                wp["prs"] = v.get("prs")
             if getattr(args, "with_briefs", False):
                 wp["brief"] = briefs.get(k)
             wps.append(wp)
         elif k.startswith("G-") and v.get("kind") == "freeze_gate":
             gates.append({"id": k, "wp": v.get("wp"), "status": v.get("status", "pending")})
-    designs = [{"path": p, "phase": d.get("phase"), "wp": d.get("wp"), "locked": d.get("locked", False)}
+    designs = [{"path": p, "phase": d.get("phase"), "wp": d.get("wp"), "locked": d.get("locked", False),
+                "design": d.get("design")}
                for p, d in anchor.get("designs", {}).items()]
+    lifecycle = _design_lifecycle(anchor, plan)
     subplans = [{"path": p, "archetype": d.get("archetype"), "ref": d.get("ref"),
                  "status": d.get("status", "active")} for p, d in anchor.get("subplans", {}).items()]
     emit({
         "plan": {"title": _plan_title(plan, anchor), "profile": anchor.get("profile"),
                  "goal": anchor.get("goal"), "slug": os.path.basename(os.path.normpath(plan))},
         "gates": gates, "wps": wps, "designs": designs, "subplans": subplans,
+        "design_lifecycle": lifecycle["designs"], "design_unlinked": lifecycle["unlinked"],
+        "coverage": lifecycle["coverage"],
         "research": {k: v.get("stamped") for k, v in anchor.get("research", {}).items()},
+        "warnings": warnings,
     })
+
+
+# --------------------------------------------------------------------------- #
+# command: emit-workflow — the deterministic renderer for orchestrate --emit-workflow
+# --------------------------------------------------------------------------- #
+
+_WP_ID_RE = re.compile(r"^WP-\d+[a-z]?$")
+WORKFLOW_REL = "artifact/orchestrate.workflow.js"
+_WORKFLOW_PLACEHOLDER_RE = re.compile(r"\{\{(name_js|description_js|meta_phases|waves_json)\}\}")
+
+
+def _workflow_waves(plan: str, anchor: dict) -> list:
+    """The WAVES array for the emitted script: validated, grouped by wave number in
+    order, each wave carrying the freeze gate(s) its WPs own. Refuses (exit 1) on
+    anything the script could not run safely: a malformed id, an unknown tier, a WP
+    with no wave or no brief."""
+    ids = anchor.get("ids", {})
+    briefs = _extract_wp_briefs(plan)
+    wps = sorted(((k, v) for k, v in ids.items() if k.startswith("WP-") and isinstance(v, dict)),
+                 key=lambda kv: _id_sort_key(kv[0]))
+    if not wps:
+        die("no work packages defined; register WP-NN IDs first (see `orchestrate`).", 1)
+    by_wave, problems = {}, []
+    for k, v in wps:
+        if not _WP_ID_RE.match(k):
+            problems.append(f"{k}: not a valid work-package id (expected WP-NN)")
+            continue
+        tier = v.get("tier")
+        tier = "sonnet" if tier is None else tier
+        if tier not in TIERS:
+            problems.append(f"{k}: invalid tier {tier!r} (expected {', '.join(TIERS)})")
+        wave = v.get("wave")
+        if isinstance(wave, bool) or not isinstance(wave, int):
+            problems.append(f"{k}: no integer `wave` in the anchor")
+            continue
+        brief = briefs.get(k)
+        if not brief:
+            problems.append(f"{k}: no `### {k}` brief in 09-orchestration.md")
+            continue
+        by_wave.setdefault(wave, []).append(
+            {"id": k, "title": str(v.get("title", "")), "tier": tier, "brief": brief})
+    if problems:
+        die("cannot emit the workflow:\n  " + "\n  ".join(problems), 1)
+    waves = []
+    for n in sorted(by_wave):
+        members = {w["id"] for w in by_wave[n]}
+        gates = {str(ids[w["id"]]["gate"]) for w in by_wave[n] if ids[w["id"]].get("gate")}
+        gates |= {g for g, e in ids.items() if g.startswith("G-") and isinstance(e, dict)
+                  and e.get("kind") == "freeze_gate" and e.get("wp") in members}
+        gate = ", ".join(sorted(gates)) or None
+        waves.append({"title": f"Wave {n}" + (f" \u00b7 {gate}" if gate else ""), "gate": gate,
+                      "wps": by_wave[n]})
+    return waves
+
+
+def render_workflow(template: str, plan_title: str, slug: str, waves: list) -> str:
+    """Fill the workflow template. Every value goes in as a JSON literal
+    (json.dumps, ASCII-only) so no title, slug, gate or brief can leave its string,
+    and the single-pass substitution never re-scans inserted text for placeholders."""
+    safe_slug = re.sub(r"[^A-Za-z0-9._-]+", "-", slug).strip("-") or "plan"
+    subs = {
+        "name_js": json.dumps("groundwork-orchestrate-" + safe_slug),
+        "description_js": json.dumps(
+            f"Run the {plan_title} build wave-by-wave: fan out work packages in each wave, "
+            f"adversarially verify every freeze gate before crossing it."),
+        "meta_phases": json.dumps([{"title": w["title"]} for w in waves]),
+        "waves_json": json.dumps(waves, indent=2),
+    }
+    return _WORKFLOW_PLACEHOLDER_RE.sub(lambda m: subs[m.group(1)], template)
+
+
+def cmd_emit_workflow(args):
+    plan = args.plan
+    anchor = load_anchor(plan)
+    waves = _workflow_waves(plan, anchor)
+    tpl = os.path.join(args.profiles_root, "_shared", "templates", "artifact", "orchestrate.workflow.js")
+    out = render_workflow(read_file(tpl), clip(_plan_title(plan, anchor), 200),
+                          os.path.basename(os.path.normpath(plan)), waves)
+    art = os.path.join(plan, "artifact")
+    if os.path.islink(art):
+        die("refusing: artifact/ is a symlink (would write outside the plan folder)", 1)
+    dest = os.path.join(plan, WORKFLOW_REL)
+    old = None
+    if os.path.isfile(dest) and not os.path.islink(dest):
+        try:
+            old = read_file_raw(dest)
+        except (OSError, UnicodeDecodeError):
+            old = None
+    rec = anchor.get("docs", {}).get(WORKFLOW_REL)
+    h = sha256_text(out)
+    result = "UNCHANGED"
+    if old != out:
+        os.makedirs(art, exist_ok=True)
+        atomic_write(dest, out)
+        result = "WRITTEN"
+    if result == "WRITTEN" or not rec or rec.get("hash") != h:
+        anchor.setdefault("docs", {})[WORKFLOW_REL] = {"hash": h, "generated_regions": []}
+        save_anchor(plan, anchor)
+    emit({"result": result, "file": WORKFLOW_REL, "waves": len(waves),
+          "wps": sum(len(w["wps"]) for w in waves)})
 
 
 def cmd_status_data(args):
@@ -896,17 +1889,31 @@ def cmd_status_data(args):
     docs = anchor.get("docs", {})
     doc_report = []
     for relpath, meta in docs.items():
-        full = os.path.join(plan, relpath)
+        full = resolve_in_plan(plan, relpath)
+        if full is None:
+            doc_report.append({"file": relpath, "state": "rejected",
+                               "reason": "path escapes the plan folder"})
+            continue
         if not os.path.exists(full):
             doc_report.append({"file": relpath, "state": "missing"})
             continue
-        text = read_file(full)
+        raw = read_regular_capped(full, _DOC_READ_CAP)
+        if raw is None or len(raw) > _DOC_READ_CAP:
+            doc_report.append({"file": relpath, "state": "rejected",
+                               "reason": "not a regular file, or larger than the read cap"})
+            continue
+        text = raw.decode("utf-8", errors="replace")
         whole_ok = sha256_text(text) == meta.get("hash")
         dirty = []
-        for reg in meta.get("generated_regions", []):
-            cur = region_content_hash(text, reg["id"])
-            if cur is not None and cur != reg["hash"]:
-                dirty.append(reg["id"])
+        try:
+            for reg in meta.get("generated_regions", []):
+                cur = region_content_hash(text, reg["id"], is_md(relpath))
+                if cur is not None and cur != reg["hash"]:
+                    dirty.append(reg["id"])
+        except FenceError as e:
+            doc_report.append({"file": relpath, "state": "malformed", "reason": f"malformed fence: {e}",
+                               "whole_file_match": whole_ok, "dirty_regions": []})
+            continue
         doc_report.append({"file": relpath,
                            "state": "in-sync" if (whole_ok and not dirty) else "drift",
                            "whole_file_match": whole_ok, "dirty_regions": dirty})
@@ -921,11 +1928,14 @@ def cmd_status_data(args):
                            for n in sorted(os.listdir(args.profiles_root))
                            if os.path.isdir(os.path.join(args.profiles_root, n))]
     wps_with_issues = sum(1 for k, v in ids.items() if k.startswith("WP-") and v.get("issue"))
+    lifecycle = _design_lifecycle(anchor, plan)
     emit({
         "profile": anchor.get("profile"), "spine_version": anchor.get("spine_version"),
         "goal": anchor.get("goal"), "created": anchor.get("created"), "updated": anchor.get("updated"),
         "docs": doc_report,
-        "ids": {"gaps": gaps, "gates": gates, "wps": wps, "designs": designs_n, "total": len(ids)},
+        "ids": {"gaps": gaps, "gates": gates, "wps": wps, "designs": designs_n,
+                "designs_locked": lifecycle["summary"]["locked"], "total": len(ids)},
+        "design_lifecycle": lifecycle,
         "issues": {"linked": wps_with_issues, "total_wps": wps},
         "subplans": [{"path": p, "archetype": d.get("archetype"), "status": d.get("status", "active"),
                       "ref": d.get("ref")} for p, d in anchor.get("subplans", {}).items()],
@@ -1013,7 +2023,8 @@ def _explorer_badges(relposix: str, ntype: str, kind: str, anchor: dict) -> dict
     d = anchor.get("designs", {}).get(relposix)
     if d:
         b["design"] = {"phase": d.get("phase"), "wp": d.get("wp"),
-                       "locked": d.get("locked", False), "locked_in": d.get("locked_in")}
+                       "locked": d.get("locked", False), "locked_in": d.get("locked_in"),
+                       "id": d.get("design")}
     sp = anchor.get("subplans", {}).get(relposix)
     if sp:
         b["subplan"] = {"archetype": sp.get("archetype"), "ref": sp.get("ref"),
@@ -1030,7 +2041,26 @@ def _explorer_walk(plan: str, rel: str, anchor: dict, budget: dict) -> dict | No
     name = os.path.basename(rel) if rel else os.path.basename(os.path.normpath(plan))
     relposix = rel.replace(os.sep, "/")
 
-    if os.path.isdir(full):
+    # Confinement: never leave the plan folder. Skip symlinks outright (file or
+    # dir), anything whose realpath is not under realpath(plan), and anything
+    # that is neither a regular file nor a directory (devices, FIFOs, sockets).
+    if rel:
+        try:
+            st = os.lstat(full)
+        except OSError:
+            return None
+        if stat.S_ISLNK(st.st_mode):
+            return None
+        root_real = budget.get("root_real") or os.path.realpath(plan)
+        if not _under_root(root_real, os.path.realpath(full)):
+            return None
+        is_dir, is_reg = stat.S_ISDIR(st.st_mode), stat.S_ISREG(st.st_mode)
+        if not (is_dir or is_reg):
+            return None
+    else:
+        is_dir, is_reg = True, False
+
+    if is_dir:
         # Skip noise dirs — but only for descendants, never the plan root itself
         # (a plan legitimately named `build`/`dist`/… must still render).
         if rel and name in _EXPLORER_SKIP_DIRS:
@@ -1067,10 +2097,7 @@ def _explorer_walk(plan: str, rel: str, anchor: dict, budget: dict) -> dict | No
         return None
     ntype = _explorer_node_type(name, relposix)
     kind = _explorer_node_kind(relposix, name, anchor)
-    try:
-        size = os.path.getsize(full)
-    except OSError:
-        size = 0
+    size = st.st_size  # advisory only; the embed pass re-measures what it reads
     registered = (relposix in anchor.get("docs", {}) or relposix in anchor.get("subplans", {})
                   or relposix in anchor.get("designs", {}) or relposix == ".groundwork.json")
     badges = _explorer_badges(relposix, ntype, kind, anchor)
@@ -1104,12 +2131,17 @@ def _explorer_embed_pass(anchor: dict, budget: dict):
         if size > _EXPLORER_PER_FILE_CAP or budget["spent"] + size > _EXPLORER_TOTAL_BUDGET:
             budget["truncated"].append(relposix)
             continue
-        try:
-            with open(full, "r", encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-        except OSError:
+        # Bounded read: stat size is advisory (it is 0 for devices and can lie),
+        # so read cap+1 bytes from a verified regular file and re-check.
+        raw = read_regular_capped(full, _EXPLORER_PER_FILE_CAP)
+        if raw is None or len(raw) > _EXPLORER_PER_FILE_CAP:
             budget["truncated"].append(relposix)
             continue
+        size = len(raw)
+        if budget["spent"] + size > _EXPLORER_TOTAL_BUDGET:
+            budget["truncated"].append(relposix)
+            continue
+        text = raw.decode("utf-8", errors="replace")
         node["content"] = text
         node["embedded"] = True
         budget["spent"] += size
@@ -1119,8 +2151,13 @@ def _explorer_embed_pass(anchor: dict, budget: dict):
         if doc:
             badges = node.setdefault("badges", {})
             whole_ok = sha256_text(text) == doc.get("hash")
-            dirty = [reg["id"] for reg in doc.get("generated_regions", [])
-                     if (region_content_hash(text, reg["id"]) or reg["hash"]) != reg["hash"]]
+            try:
+                dirty = [reg["id"] for reg in doc.get("generated_regions", [])
+                         if (region_content_hash(text, reg["id"], is_md(relposix)) or reg["hash"]) != reg["hash"]]
+            except FenceError as e:
+                dirty = []
+                whole_ok = False
+                badges["malformed_fence"] = str(e)
             badges["drift"] = "in-sync" if (whole_ok and not dirty) else "drift"
             if dirty:
                 badges["dirty_regions"] = dirty
@@ -1133,13 +2170,14 @@ def cmd_explorer_data(args):
     plan = args.plan
     anchor = load_anchor(plan)
     budget = {"spent": 0, "files": 0, "dirs": 0, "embedded": 0,
-              "referenced": 0, "truncated": [], "embeddable": [], "seen_dirs": set()}
+              "referenced": 0, "truncated": [], "embeddable": [], "seen_dirs": set(),
+              "root_real": os.path.realpath(plan)}
     root = _explorer_walk(plan, "", anchor, budget)
     _explorer_embed_pass(anchor, budget)
     tree = root["children"] if root else []
     emit({
-        "plan": {"title": _plan_title(plan, anchor), "profile": anchor.get("profile"),
-                 "goal": anchor.get("goal"),
+        "plan": {"title": clip(_plan_title(plan, anchor)), "profile": anchor.get("profile"),
+                 "goal": clip(anchor.get("goal")),
                  "slug": os.path.basename(os.path.normpath(plan))},
         "tree": tree,
         "ids": anchor.get("ids", {}),
@@ -1162,9 +2200,8 @@ def _plan_rollup(plan_dir: str, name: str) -> dict | None:
     ap = os.path.join(plan_dir, ANCHOR)
     if not os.path.exists(ap):
         return None
-    try:
-        anchor = json.loads(read_file(ap))
-    except Exception:
+    anchor, err = parse_anchor(ap)
+    if err:
         return None
     ids = anchor.get("ids", {})
     wp = {}
@@ -1176,20 +2213,29 @@ def _plan_rollup(plan_dir: str, name: str) -> dict | None:
     for v in gates:
         s = v.get("status", "pending"); gate[s] = gate.get(s, 0) + 1
     designs = anchor.get("designs", {})
+    lifecycle = _design_lifecycle(anchor, plan_dir)["summary"]
+    if lifecycle["total"]:  # D-NN are the designs; files are variants of them
+        design_roll = {k: lifecycle[k] for k in ("total", "locked", "planned", "drafted",
+                                                 "in_progress", "implemented", "verified", "unlinked")}
+    else:  # legacy plan: only file registrations
+        design_roll = {"total": len(designs),
+                       "locked": sum(1 for x in designs.values() if isinstance(x, dict) and x.get("locked"))}
     subs = anchor.get("subplans", {})
     # drift: any tracked doc whose on-disk hash diverged (or vanished)
     drift = False
     for rel, meta in anchor.get("docs", {}).items():
-        f = os.path.join(plan_dir, rel)
-        if not os.path.exists(f) or sha256_text(read_file(f)) != meta.get("hash"):
+        f = resolve_in_plan(plan_dir, rel)
+        raw = read_regular_capped(f, _DOC_READ_CAP) if f and os.path.exists(f) else None
+        if raw is None or len(raw) > _DOC_READ_CAP or \
+                sha256_text(raw.decode("utf-8", errors="replace")) != meta.get("hash"):
             drift = True; break
     return {
-        "slug": name, "path": name, "title": _plan_title(plan_dir, anchor),
-        "profile": anchor.get("profile"), "goal": anchor.get("goal"),
+        "slug": name, "path": name, "title": clip(_plan_title(plan_dir, anchor)),
+        "profile": anchor.get("profile"), "goal": clip(anchor.get("goal")),
         "updated": (anchor.get("updated") or "")[:10],
         "wps": {"total": sum(wp.values()), **wp},
         "gates": {"total": len(gates), **gate},
-        "designs": {"total": len(designs), "locked": sum(1 for x in designs.values() if x.get("locked"))},
+        "designs": design_roll,
         "subplans": {"total": len(subs), "active": sum(1 for x in subs.values() if x.get("status", "active") == "active")},
         "research": {k: v.get("stamped") for k, v in anchor.get("research", {}).items()},
         "drift": drift,
@@ -1210,7 +2256,11 @@ def cmd_plans_index_data(args):
         d = os.path.join(root, name)
         if not os.path.isdir(d):
             continue
-        r = _plan_rollup(d, name)
+        try:
+            r = _plan_rollup(d, name)
+        except Exception as e:  # one malformed plan must not take the whole index down
+            sys.stderr.write(f"plans-index-data: skipping {name}: {type(e).__name__}: {e}\n")
+            r = None
         if r is not None:
             plans.append(r)
     by_profile = {}
@@ -1236,12 +2286,12 @@ def cmd_write_region_plain(args):
     new_content = (args.content if args.content is not None else read_file(args.content_file)).strip("\n")
     if getattr(args, "html_script_safe", False):
         new_content = _html_script_escape(new_content)
-    text = read_file(full)
-    r = find_region(text, fid)
-    if r is None:
-        die(f"fence '{fid}' not found in {full}", 1)
+    _refuse_marker_lines(new_content, full)
+    text = read_file_raw(full)
+    md = is_md(full)
+    r = _region_or_die(text, fid, md, full)
     (s0, s1), (e0, e1), inner = r
-    if _strip_meta(inner).strip() == new_content.strip():
+    if sha256_text(_strip_meta(inner)) == body_hash(new_content):
         emit({"result": "UNCHANGED", "file": full, "id": fid}); return
     start_line = text[s0:s1]
     if start_line.lstrip().startswith("//"):
@@ -1250,7 +2300,9 @@ def cmd_write_region_plain(args):
         meta = f"# last_action: plans-index · {_now()}"
     else:
         meta = f"<!-- last_action: plans-index · {_now()} -->"
-    new_text = text[:s1] + f"\n{meta}\n{new_content}\n" + text[e0:]
+    nl = _file_nl(text)
+    new_text = text[:s1] + f"{nl}{meta}{nl}{_with_nl(new_content, nl)}{nl}" + text[e0:]
+    _check_fences_after(new_text, md, full)
     atomic_write(full, new_text)
     emit({"result": "WRITTEN", "file": full, "id": fid})
 
@@ -1260,11 +2312,11 @@ def cmd_write_region_plain(args):
 # --------------------------------------------------------------------------- #
 
 # `## Phase N — <title>` heading in 05-tracking.md (or `## Phase N: <title>`).
-_PHASE_HEAD_RE = re.compile(r"^##\s+Phase\s+(\d+(?:\.\d+)?)\s*[—:\-]\s*(.+?)\s*$", re.M)
+_PHASE_HEAD_RE = re.compile(r"^##\s+Phase\s+(\d+(?:\.\d+)?)\s*[—:\-]\s*(\S(?:.*\S)?)[ \t]*$", re.M)
 # `### WP-<id> — <title>` heading underneath a phase.
-_WP_HEAD_RE = re.compile(r"^###\s+WP-([A-Za-z0-9]+)\s*[—:\-]\s*(.+?)\s*$", re.M)
+_WP_HEAD_RE = re.compile(r"^###\s+WP-([A-Za-z0-9]+)\s*[—:\-]\s*(\S(?:.*\S)?)[ \t]*$", re.M)
 # `## Round N — <title> (<date>)` heading in 04-discussion.md.
-_ROUND_HEAD_RE = re.compile(r"^##\s+Round\s+(\d+)\s*[—:\-]\s*(.+?)\s*$", re.M)
+_ROUND_HEAD_RE = re.compile(r"^##\s+Round\s+(\d+)\s*[—:\-]\s*(\S(?:.*\S)?)[ \t]*$", re.M)
 # Date inside parentheses at the end of a round heading: `… (2026-05-27)`.
 _PAREN_DATE_RE = re.compile(r"\((\d{4}-\d{2}-\d{2})\)\s*$")
 # `## Risks` section heading variants in 01-plan.md.
@@ -1441,7 +2493,10 @@ def cmd_living_spec_data(args):
     discussion = _read_optional(plan, "04-discussion.md")
     if discussion:
         # Prefer the rounds-index fence (canonical).
-        r = find_region(discussion, "rounds-index")
+        try:
+            r = find_region(discussion, "rounds-index", True)
+        except FenceError:
+            r = None  # malformed 04: fall back to the heading scan; `status` reports the fence
         if r is not None:
             _, _, inner = r
             rounds = _rounds_from_index(_strip_meta(inner))
@@ -1498,6 +2553,14 @@ def cmd_living_spec_data(args):
         elif kind == "gap" or (k.startswith("G-") and kind != "freeze_gate"):
             gap_status_counter[v.get("status", "open")] += 1
 
+    # ---- designs (derived lifecycle, one entry per D-NN) ---- #
+    lifecycle = _design_lifecycle(anchor, plan)
+    designs = [{k: d[k] for k in ("id", "title", "phase", "design_state", "build_state",
+                                  "locked_in", "verified_in")} | {"wps": [w["id"] for w in d["wps"]]}
+               for d in lifecycle["designs"]]
+    for ph in phases:
+        ph["design_ids"] = [d["id"] for d in designs if d["phase"] == ph["id"]]
+
     plan_slug = os.path.basename(os.path.normpath(plan))
     emit({
         "plan": {
@@ -1507,6 +2570,7 @@ def cmd_living_spec_data(args):
             "goal": anchor.get("goal"),
         },
         "generated_at": _now(),
+        "designs": designs,
         "phases": phases,
         "rounds": rounds,
         "risks_raw": risks_raw,
@@ -1553,7 +2617,12 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--profiles-root", required=True)
     g.add_argument("--profile", required=True)
     g.add_argument("--goal", required=True)
-    g.add_argument("--force", action="store_true")
+    g.add_argument("--force", action="store_true",
+                   help="re-render fence interiors of existing spine files only; keeps prose "
+                        "outside fences and all anchor state (ids/designs/subplans/research)")
+    g.add_argument("--reset-all", action="store_true", dest="reset_all",
+                   help="DESTRUCTIVE: overwrite every spine file with its blank template and "
+                        "replace the anchor (loses hand-written prose, IDs, designs, subplans)")
     g.set_defaults(func=cmd_scaffold)
 
     g = sub.add_parser("read-region", help="print a fence region's inner content")
@@ -1571,6 +2640,11 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--force", action="store_true")
     g.add_argument("--html-script-safe", action="store_true",
                    help="escape </script>-breaking chars (<>&) — for JSON written into an HTML <script> fence")
+    g.add_argument("--wrap-script", metavar="ID",
+                   help="content is bare JSON: validate it, escape it and wrap it in "
+                        "<script type=... id=ID>...</script> (for fences that own the whole script element)")
+    g.add_argument("--wrap-script-type", default=None,
+                   help="script type for --wrap-script (default application/groundwork+json)")
     g.set_defaults(func=cmd_write_region)
 
     g = sub.add_parser("next-id", help="compute the next free ID of a kind")
@@ -1606,6 +2680,14 @@ def build_parser() -> argparse.ArgumentParser:
                    help="include per-WP brief (parsed from 09-orchestration.md) + tier; "
                         "feeds the orchestrate --emit-workflow generator")
     g.set_defaults(func=cmd_board_data)
+
+    g = sub.add_parser("emit-workflow",
+                       help="render artifact/orchestrate.workflow.js from the anchor + 09 briefs "
+                            "(every value inserted as a JSON literal; refuses invalid tiers / missing briefs)")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--profiles-root", default=os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "profiles"))
+    g.set_defaults(func=cmd_emit_workflow)
 
     g = sub.add_parser("status-data", help="emit the computed status model")
     g.add_argument("--plan", required=True)
@@ -1666,6 +2748,59 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--plan", required=True)
     g.add_argument("--updates-file", required=True)
     g.set_defaults(func=cmd_apply_issue_sync)
+
+    # ---- design lifecycle ----
+    g = sub.add_parser("register-design", help="register a design variant file and link it to a D-NN")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--file", required=True, help="path relative to --plan, e.g. designs/d-01-a.html")
+    g.add_argument("--id", help="D-NN to link the file to (must be registered)")
+    g.add_argument("--phase")
+    g.add_argument("--wp")
+    g.set_defaults(func=cmd_register_design)
+
+    g = sub.add_parser("design-lock", help="lock a D-NN on one variant file, recording the round")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--id", required=True)
+    g.add_argument("--round", required=True, help="round number, e.g. 5 or 'Round 5'")
+    g.add_argument("--file", action="append",
+                   help="a locked variant; repeat for complementary variants. Required when the "
+                        "design has several files and isn't locked yet")
+    g.set_defaults(func=cmd_design_lock)
+
+    g = sub.add_parser("design-unlock", help="unlock a D-NN (records the round, clears verification)")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--id", required=True)
+    g.add_argument("--round", required=True)
+    g.add_argument("--reason", required=True)
+    g.set_defaults(func=cmd_design_unlock)
+
+    g = sub.add_parser("design-verify", help="record that an implementation of a locked D-NN passed conformance")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--id", required=True)
+    g.add_argument("--round", required=True)
+    g.add_argument("--force", action="store_true", help="verify even if not locked + implemented")
+    g.set_defaults(func=cmd_design_verify)
+
+    g = sub.add_parser("register-design-impl", help="record the D-NN a WP (and optionally a PR) implements")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--wp", required=True)
+    g.add_argument("--designs", required=True, help="comma-separated D-NN list, or 'none'")
+    g.add_argument("--replace", action="store_true", help="set implements exactly instead of adding")
+    g.add_argument("--pr", type=int)
+    g.add_argument("--url")
+    g.add_argument("--pr-state", choices=["open", "merged", "closed"])
+    g.set_defaults(func=cmd_register_design_impl)
+
+    g = sub.add_parser("design-migrate", help="link legacy designs[path] entries to D-NN and lift old locks")
+    g.add_argument("--plan", required=True)
+    g.add_argument("--dry-run", action="store_true")
+    g.add_argument("--include-unregistered", action="store_true",
+                   help="also register designs/**/*.html on disk whose d-NN filename token matches a D-NN")
+    g.set_defaults(func=cmd_design_migrate)
+
+    g = sub.add_parser("design-data", help="emit the derived design lifecycle + coverage model")
+    g.add_argument("--plan", required=True)
+    g.set_defaults(func=cmd_design_data)
 
     return p
 

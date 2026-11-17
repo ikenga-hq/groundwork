@@ -36,6 +36,7 @@ Returns JSON with:
 - **`rounds`**: `[{ round, date, topic, status, heading_line, body_anchor }]` — one entry per row in the `04-discussion.md` rounds-index fence (newest first).
 - **`risks_raw`**: `[{ raw_line, severity_hint, source }]` — one entry per bullet under `01-plan.md §Risks` (and any `### New risks folded` rounds), with the leading `**R<n> —**` / `**G-<NN> —**` prefix stripped and a severity hint (`critical` / `important` / `nice`) inferred from any tag in the bullet.
 - **`ids_summary`**: gates/gaps/WP counts by status — for cross-checking against what the round summaries say.
+- **`designs`**: one entry per `D-NN` — `{ id, title, phase, design_state, build_state, locked_in, verified_in, wps }` (the same derivation as `design-data`). Each `phases[]` entry also carries `design_ids` (the `D-NN` whose `phase` matches). Use them in the per-phase `note` ("D-01..D-03 locked, D-01 verified") and in round summaries. The template doesn't yet render a dedicated designs panel.
 
 The script does NOT synthesize prose. It hands back the **raw materials**; the action's job is to craft the human-readable summary for each round and each risk.
 
@@ -49,18 +50,13 @@ For phases, the script already gives you status + headline; the action's job is 
 
 ### 3. Write the fence
 
-The fence wraps the full `<script type="application/groundwork+json" id="groundwork-spec-state">…</script>` block in `artifact/index.html` — the `<script>` tags are inside the fenced region (the React app uses `getElementById('groundwork-spec-state')` to read the JSON, so the tags MUST be present in the fence content). Your content payload is the full block:
-
-```
-<script type="application/groundwork+json" id="groundwork-spec-state">{...JSON...}</script>
-```
-
-Write the full block in one go:
+The fence wraps the full `<script type="application/groundwork+json" id="groundwork-spec-state">…</script>` block in `artifact/index.html` — the `<script>` tags are inside the fenced region (the React app uses `getElementById('groundwork-spec-state')` to read the JSON, so the tags MUST be present). **Do not hand-assemble the tags.** Write the *bare JSON* to a file and let the script add the tags with `--wrap-script groundwork-spec-state`: it validates the JSON and escapes `<`, `>` and `&` to `\uXXXX` (round-trips through `JSON.parse`), so risk bullets and round topics copied from `01-plan.md` / `04-discussion.md` containing `</script>` cannot close the element early. **Always pass `--wrap-script`** for this fence.
 
 ```bash
 python3 <skill>/scripts/groundwork_state.py write-region \
   --plan <plan> --file artifact/index.html --id spec-state \
-  --action refresh-living-spec --content-file /tmp/spec-state-block.html
+  --action refresh-living-spec --content-file /tmp/spec-state.json \
+  --wrap-script groundwork-spec-state
 ```
 
 The script does hash-diff: byte-identical no-op on re-run; refuses if the on-disk content has been hand-edited inside the fence (use `--force` to overwrite). It updates `.groundwork.json.docs["artifact/index.html"]` with the new whole-file + region hashes, and records `refresh_living_spec.last_run` in the anchor.

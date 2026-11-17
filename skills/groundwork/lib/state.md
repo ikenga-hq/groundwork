@@ -26,14 +26,16 @@ python3 <skill>/scripts/groundwork_state.py <subcommand> [args]
   spine-gate       --plan DIR --expected 1 [--readonly]      # 3-clause version gate (exit 3 = refuse)
   validate-profile --profiles-root DIR (--name N | --all)    # 10 rules, canonical error strings
   resolve-profile  --profiles-root DIR --name N              # merged labels + spine + overrides
-  scaffold         --plan DIR --profiles-root DIR --profile N --goal STR [--force]
+  scaffold         --plan DIR --profiles-root DIR --profile N --goal STR [--force | --reset-all]
+                       # --force: re-render fence interiors of existing files only, keep anchor state; --reset-all: DESTRUCTIVE full overwrite + new anchor
   read-anchor      --plan DIR
   read-region      --file PATH --id ID
-  write-region     --plan DIR --file REL --id ID --action NAME (--content STR | --content-file P) [--force]
+  write-region     --plan DIR --file REL --id ID --action NAME (--content STR | --content-file P) [--force] [--html-script-safe | --wrap-script ID]
                        # prints WRITTEN | UNCHANGED | SKIPPED_DIRTY
   next-id          --plan DIR --kind gap|wp|gate|design [--name NAME]
   register-id      --plan DIR --id ID --doc DOC [--field k=v ...]
-  board-data       --plan DIR
+  board-data       --plan DIR [--with-briefs]
+  emit-workflow    --plan DIR [--profiles-root DIR]          # render artifact/orchestrate.workflow.js (JSON-literal placeholders; WRITTEN | UNCHANGED)
   status-data      --plan DIR [--profiles-root DIR]
   explorer-data    --plan DIR                                # typed file-tree model for artifact/explorer.html
   plans-index-data --plans-dir DIR                           # cross-plan rollup of every plan under a plans/ dir
@@ -42,6 +44,16 @@ python3 <skill>/scripts/groundwork_state.py <subcommand> [args]
   register-milestone --plan DIR --phase P1 --title T --id ID --url URL
   issue-sync-data  --plan DIR                                # JSON model for issue sync & export
   apply-issue-sync --plan DIR --updates-file PATH            # apply batch status updates from git issue sync
+
+  # design lifecycle — see §"Design lifecycle" (every command is idempotent: a no-op writes nothing)
+  register-design  --plan DIR --file designs/X.html [--id D-NN] [--phase P] [--wp WP-NN]
+  design-lock      --plan DIR --id D-NN --round N [--file designs/X.html ...] # --file repeats; LOCKED | UNCHANGED | NORMALIZED
+  design-unlock    --plan DIR --id D-NN --round N --reason STR             # clears verified_in
+  design-verify    --plan DIR --id D-NN --round N [--force]                # needs locked + implemented
+  register-design-impl --plan DIR --wp WP-NN --designs D-01,D-02|none [--replace]
+                       [--pr N [--url URL] [--pr-state open|merged|closed]]
+  design-migrate   --plan DIR [--dry-run] [--include-unregistered]         # link legacy designs[path] to D-NN
+  design-data      --plan DIR                                               # derived lifecycle + coverage model
 ```
 
 Every subcommand prints a JSON result to stdout (parse it to report back). Exit codes: `0` ok · `1` hard error/refusal · `2` missing/corrupt anchor · `3` spine-gate refusal. The contract details below define *why* each behaves as it does; the script is *how*.
@@ -111,7 +123,10 @@ Lives at the root of every groundwork plan folder (alongside `00-README.md`). It
 - **`ids`** — the **traceability backbone** (Round 2). Every `G-NN` / `WP-NN` / `G-<NAME>` ID lives here with its origin doc and the set of docs it touches. The review action computes the affected-doc set from this registry + region hashes — no guessing.
 - **`ids[WP-NN].tier`** — *optional* model tier (`opus` / `sonnet` / `haiku`) by task weight, stamped by `orchestrate` (heuristic default, user-overridable via `--field tier=<t>`). Surfaced by `board-data` and consumed by the emitted Workflow (`agent(…, {model})`) and the orchestrator's improvised spawns. See [`schemas.md` §"Model tiers"](schemas.md). Absent → consumers default to `sonnet`.
 - **`ids[WP-NN].drift_log[]`** (Round 8 · G-13) — *optional* per-WP audit trail of in-flight scope changes. Empty by default; only present when the shipped code diverged from the WP's sub-plan or brief. Each entry: `{round: <N>, commit: "<sha>", scope_change: "<one line>", justification: "<one line>", subplan_section: "<§ name>" | null}`. Populated by the orchestrator when a WP report mentions a "beyond the diff plan" decision (mirrors the matching `## Drift log` row in the diff-plan sub-plan). Surfaces in `review` and `status`: a future review pass greps `drift_log[]` for "shipped code matches plan?" verification. WPs that match plan keep the field absent — empty `drift_log[]` is a positive signal, not noise.
-- **`designs`** — Round 3 design-coverage registry; `clarify` checks for visual-profile readiness, `status` reports gaps, `orchestrate` cites locked designs in the relevant WP briefs.
+- **`designs`** — the design **variant-file** registry, keyed by path. Each entry links to its design with `design: "D-NN"`; `locked` / `locked_in` on an entry are a **mirror** of the design's lock, kept for older readers (explorer badges, plans-index). The design itself — and every lifecycle field — lives on `ids[D-NN]`. See [§"Design lifecycle"](#design-lifecycle).
+- **`ids[D-NN]`** — the canonical design record: `title`, `phase`, `files[]` (linked variants), `locked`, `locked_files[]` (the locked variant set — usually one), `locked_file` (its first entry), `locked_in`, `unlocked_in`, `verified_in`, `history[]` (`{action: lock|unlock|verify, round, file, reason, at}`). A `D-NN` may exist with no files (a planned surface). Written only by the design commands, never by hand.
+- **`ids[WP-NN].implements[]` / `.prs[]`** — the designs a work package builds (`register-design-impl`) and its PR records `{number, url, state: open|merged|closed, designs[]}`. Design build status is derived from these plus WP `status`.
+- **`ids[G-NN].design` / `.state` / `.location`** — set on `design-review` and `design-conformance` findings, so a finding reads `G-NN · D-NN · state · file:line` and attaches to its design.
 - **`subplans`** — Focused `NN-*.md` sub-plans (numbered ≥ 06). `subplan` action creates them; `status` lists them; `review` notes when a finding touches one. **No `SP-NN` ID** — sub-plans are file-numbered, not ID-allocated; cross-references happen by filename (and by the optional `ref` field linking to a WP / gap / section). `status` field is hand-edited: `active` / `landed` / `abandoned` / `deferred`.
 - **`research`** — freshness stamps surfaced on the board.
 
@@ -297,6 +312,11 @@ Inside HTML, JSON, or any non-markdown file, use the same `<!-- … -->` form wh
 3. **Unrecognized fences are left untouched** — even by the action that "owns" the file. A user can introduce their own fences with IDs like `notes-<anything>` and groundwork won't fight them.
 4. **A fenced block missing from `.groundwork.json`** is a new fence; on first action run, it's recorded.
 5. **A fence present in `.groundwork.json` but not in the file** is treated as a hand-removal — `status` reports it; the next action run does not re-create it.
+6. **Markers inside a fenced code block are not fences (markdown files).** A ``` / ~~~ block that quotes the syntax can't masquerade as a region.
+7. **Malformed fences are refused, never guessed at.** A duplicate start, a nested or overlapping region, an unterminated start or an orphan end makes every read / write on that file exit 1 with the reason (`scaffold --force` skips it and lists it under `malformed_fences`); `status-data` reports the doc as `state: "malformed"`.
+8. **Written content may not itself contain a marker line** (`<!-- | // | # groundwork:auto:start|end …`), and may not leave the file's fences malformed (e.g. an unbalanced ``` block): `write-region` / `write-region-plain` refuse it (exit 1) instead of letting it truncate or capture a region.
+9. **`init` only moves the baseline of regions it wrote.** Re-running `init` over an existing file never re-records a region it did not rewrite, so a hand edit inside a fence stays detectable (`SKIPPED_DIRTY`) afterwards.
+10. **Line endings are preserved.** A CRLF file is rewritten with CRLF; the region hash is newline-agnostic and splits on `\n` only.
 
 ### Reserved fence IDs (by action)
 
@@ -322,7 +342,9 @@ Inside HTML, JSON, or any non-markdown file, use the same `<!-- … -->` form wh
 | `artifact/explorer.html` | `explorer-meta` | `explorer` |
 | `artifact/index.html` | `spec-state` | `refresh-living-spec` |
 
-`artifact/index.html` is the **living spec** — scaffolded from `profiles/_shared/templates/artifact/index.html` at `init` and updated only inside the `spec-state` fence by `refresh-living-spec`. Everything outside the fence (the hand-authored Overview tab) is preserved across re-runs. `artifact/board.html` is the generated tracking board — `refresh-board` owns it. `artifact/explorer.html` is the generated file-explorer — `explorer` owns its two fences (`explorer-data`/`explorer-meta`) and nothing else; it *opens* `board.html`, `index.html`, and `designs/*.html` as iframe tabs but never writes them. Both `explorer-data` and `explorer-meta` use the `<!-- … -->` comment fence form (they live inside `<script type="application/json">` blocks, like `board-data`). Because they sit inside a `<script>` element, every write to them passes **`write-region --html-script-safe`** (and `write-region-plain --html-script-safe` for the plans-index), which escapes `<`/`>`/`&` to `\uXXXX` so an embedded file body containing a literal `</script>` can't terminate the block (a JSON-parse break → silent mock fallback, and an HTML-injection → XSS). The escapes round-trip through `JSON.parse` to the original characters. *(The pre-existing `board-data` fence shares this latent exposure for `--with-briefs`; a follow-up should apply the same flag there.)*
+`artifact/index.html` is the **living spec** — scaffolded from `profiles/_shared/templates/artifact/index.html` at `init` and updated only inside the `spec-state` fence by `refresh-living-spec`. Everything outside the fence (the hand-authored Overview tab) is preserved across re-runs. `artifact/board.html` is the generated tracking board — `refresh-board` owns it. `artifact/explorer.html` is the generated file-explorer — `explorer` owns its two fences (`explorer-data`/`explorer-meta`) and nothing else; it *opens* `board.html`, `index.html`, and `designs/*.html` as iframe tabs but never writes them. Both `explorer-data` and `explorer-meta` use the `<!-- … -->` comment fence form (they live inside `<script type="application/json">` blocks, like `board-data`). Because they sit inside a `<script>` element, every write to them passes **`write-region --html-script-safe`** (and `write-region-plain --html-script-safe` for the plans-index), which escapes `<`/`>`/`&` to `\uXXXX` so an embedded file body containing a literal `</script>` can't terminate the block (a JSON-parse break → silent mock fallback, and an HTML-injection → XSS). The escapes round-trip through `JSON.parse` to the original characters. `board-data` and `board-meta` in `artifact/board.html` get the same treatment: `refresh-board` always passes `--html-script-safe` for both. The `spec-state` fence is different because it owns the whole `<script>` element; for it `refresh-living-spec` passes bare JSON with **`--wrap-script groundwork-spec-state`**, and the script validates the JSON, escapes it and adds the `<script>` tags itself. Neither fence is exposed to plan text containing `</script>` any more.
+
+**Path confinement.** Anything read via a path from `.groundwork.json` `docs` keys or a directory walk (`status-data`, `plans-index-data`, `explorer-data`) must resolve under `realpath(<plan>)`, be a regular file, and is read with a size cap. `explorer-data` additionally never follows symlinks and only embeds regular files. `scaffold --force` never rewrites prose outside fences; generators replace a symlink at `artifact/explorer.html` / `_index.html` atomically rather than writing through it.
 
 The cross-plan **`plans-index`** action is the one writer that is **not** anchor-scoped: its output `<plans-dir>/_index.html` spans many plans and belongs to no single `.groundwork.json`, so it is not listed in any `docs` map and uses the anchorless `write-region-plain` (idempotent by content-equality, no hash registry) on the `plans-index-data` / `plans-index-meta` fences. It only ever reads the plans it lists — never writes into them.
 
@@ -381,9 +403,76 @@ IDs thread `01-plan.md` → `05-tracking.md` → `09-orchestration.md` → board
 | **Gap** | `G-NN` | `G-12` | Review pass — a finding folded into a Round |
 | **Work package** | `WP-NN` (+ optional letter slice) | `WP-05`, `WP-05a` | Orchestrate — derived from `05-tracking` sections |
 | **Freeze gate** | `G-<NAME>` (uppercase, kebab) | `G-SCHEMA`, `G-ADAPTER` | Orchestrate — declared in plan §Freeze gates |
-| **Design** | `D-NN` | `D-01` | Design pass — one per `designs/*.html` produced |
+| **Design** | `D-NN` | `D-01` | Design pass or plan authoring — one per designed surface (its `designs/*.html` variants link to it) |
 
 `G-` is reused intentionally: a freeze gate is uppercase + name, a gap is uppercase + number. They never collide.
+
+A `D-NN` names a **designed surface or decision**, not a file: it may be registered before any mockup exists, and it links to one or more `designs/*.html` variants (see §"Design lifecycle").
+
+---
+
+## Design lifecycle
+
+Designs run the same traceable loop as the rest of the plan: **produce → review → lock → implement → verify**. One model, two linked registries:
+
+| Registry | Keyed by | Holds |
+|---|---|---|
+| `ids[D-NN]` — **canonical** | design | `title`, `phase`, `files[]`, `locked`, `locked_file`, `locked_in`, `unlocked_in`, `verified_in`, `history[]` |
+| `designs[<path>]` | variant file | `phase`, `wp`, `pane_ids`, `revision`, `design: "D-NN"`, and a **mirror** of `locked` / `locked_in` for older readers |
+
+```jsonc
+"ids": {
+  "D-03":  { "doc": "01-plan.md", "kind": "design", "title": "Deal-breakers", "phase": "P1",
+             "files": ["designs/d-03-cards.html", "designs/d-03-list.html"],
+             "locked": true, "locked_file": "designs/d-03-cards.html", "locked_in": "Round 4",
+             "verified_in": "Round 7",
+             "history": [{ "action": "lock", "round": "Round 4", "file": "designs/d-03-cards.html", "at": "…" },
+                         { "action": "verify", "round": "Round 7", "at": "…" }] },
+  "WP-02": { "doc": "05-tracking.md", "status": "done", "implements": ["D-03"],
+             "prs": [{ "number": 42, "url": "…", "state": "merged", "designs": ["D-03"] }] },
+  "G-14":  { "doc": "04-discussion.md", "kind": "design-conformance", "status": "resolved",
+             "design": "D-03", "state": "error", "location": "app/onboarding/DealBreakers.tsx:88" }
+},
+"designs": {
+  "designs/d-03-cards.html": { "phase": "P1", "wp": "WP-02", "design": "D-03", "locked": true, "locked_in": "Round 4" },
+  "designs/d-03-list.html":  { "phase": "P1", "wp": "WP-02", "design": "D-03", "locked": false }
+}
+```
+
+### Transitions (script commands — never hand-edit)
+
+| Step | Command | Records |
+|---|---|---|
+| produce | `register-design --file designs/X.html --id D-NN` | the variant in `designs`, the link both ways |
+| review | `review --target D-NN` → `register-id … --field design=D-NN --field state=… --field location=file:line` | findings attached to the design |
+| lock | `design-lock --id D-NN --round N [--file X]` | `locked`, `locked_file`, `locked_in`, history; mirror on variants |
+| unlock | `design-unlock --id D-NN --round N --reason S` | `unlocked_in`, clears `verified_in`, history |
+| implement | `register-design-impl --wp WP-NN --designs D-NN [--pr N --url U --pr-state open\|merged\|closed]` | `ids[WP].implements[]`, `ids[WP].prs[]` |
+| verify | `design-verify --id D-NN --round N` | `verified_in`, history (refuses unless locked + implemented) |
+
+Every command is idempotent: re-running with nothing new prints `UNCHANGED` and leaves the anchor — `updated` included — byte-identical.
+
+### Derived state (computed by `design-data`, `board-data`, `status-data`; never stored)
+
+| Field | Values | Rule |
+|---|---|---|
+| `design_state` | `planned` → `drafted` → `locked` | locked if the design is locked; else drafted if it has files; else planned |
+| `build_state` | `unbuilt` · `in_progress` · `implemented` · `verified` | **implemented** if a `merged` PR lists the design, or every implementing WP is `done`; else **in_progress** if an implementing WP is `in_progress`/`done` or a listed PR is `open`; else **unbuilt**. **verified** = implemented + locked + `verified_in` set |
+| `warnings[]` | — | built against an unlocked design · locked without a file · locked file missing on disk · `verified_in` set but no longer locked + implemented |
+| `coverage[]` | per phase | `{phase, designs: locked, of: D-NN count, implemented, verified, unlinked, unlinked_locked, ok}` |
+
+WP `status` already tracks forge issue state through `issue-sync`, so issues feed build status without a separate path; PR records come from the orchestrator (at PR open / merge) or from `issue-sync` parsing each PR body's `Designs implemented:` line.
+
+### Migration (legacy anchors)
+
+A design may lock **several** complementary variants (a main screen plus a returning-member path, say): pass `--file` more than once. `locked_files[]` holds the set, and `locked_file` is its first entry for readers that want one path.
+
+Older anchors come in three shapes, all **read as-is**:
+- locks on `designs[<path>]` with no `D-NN` link;
+- `D-NN` in `ids` with no files;
+- a hand-rolled lock: variants linked with `id: "D-NN"` (read as an alias of `design`) and `locked: true` on the ID with no file named. The locked files are then the linked variants that carry `locked: true`.
+
+A file-level lock counts for its design once linked, and unlinked files are reported under `unlinked` (with a `suggested_id` from a `d-NN-…` filename). `design-migrate [--dry-run] [--include-unregistered]` brings an anchor forward: links files to `D-NN` by an existing `design` field or a filename token, lifts legacy locks onto the ID, copies `phase`, and optionally registers matching `designs/*.html` found on disk. It never allocates IDs; unmatched files are listed for a deliberate `next-id` + `register-design`.
 
 ### Threading rules
 

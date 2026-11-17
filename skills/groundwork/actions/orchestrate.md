@@ -25,7 +25,7 @@
    - **Per-WP briefs**: one self-contained brief per `WP-NN`, following the brief template.
    - **Model tier per WP**: stamp each `WP-NN` with a `tier` (`opus` / `sonnet` / `haiku`) by task weight (see [`../lib/schemas.md` §"Model tiers"](../lib/schemas.md)). Heuristic default — architecture/novel → `opus`, routine build → `sonnet`, mechanical → `haiku`; user-overridable via `--field tier=<t>`.
    - **Worktree-vs-branch recommendation**: based on parallel WP count and isolation axis.
-4. **Cite locked designs**: each `WP-NN` whose phase has a locked `D-NN` cites the design path in its brief.
+4. **Link designs to work packages**: read `groundwork_state.py design-data --plan <plan>`. For each `WP-NN` that builds a designed surface, declare the link explicitly: `register-design-impl --plan <plan> --wp WP-NN --designs D-01,D-03`. That link is what later derives each design's build status. The brief's `DESIGNS` field lists each implemented `D-NN` with its locked file, lock round, and the states the spec names. Only a WP with no `implements` falls back to the old phase match (every locked `D-NN` in its phase), marked `(inferred — declare with register-design-impl)`. A WP that implements an unlocked design fails clarify check 3 unless the user opts in, and its brief says so.
 5. **Write `09-orchestration.md`** — this is the one file `orchestrate` rewrites whole; the convention is "delete and re-author." Hand-written sections live above an explicit `<!-- groundwork:auto:start orchestration -->` fence and are preserved.
 6. **Update `.groundwork.json`**:
    - Bump `docs["09-orchestration.md"]`.
@@ -74,8 +74,8 @@ How to drive the build with **one orchestrator agent + per-{{vocab.work_unit}} s
 
 ```
 GOAL · REPO/OWNER · BRANCH/SCOPE · DEPENDS-ON · FILES (create/touch) · CONSUMES · PRODUCES ·
-DO-NOT-TOUCH · DESIGN REFERENCE (if a locked D-NN applies) · DEFINITION OF DONE ·
-MOCK (if upstream not ready) · REPORT
+DO-NOT-TOUCH · DESIGN REFERENCE (if a locked D-NN applies) · DESIGNS (D-NN implemented) ·
+DEFINITION OF DONE · MOCK (if upstream not ready) · REPORT
 ```
 
 The agent brief in `agents/orchestrator.md` and the per-WP example below use the same shape — `REPO` resolves to `OWNER` under the `general` profile, `BRANCH` resolves to `SCOPE`, and `DESIGN REFERENCE` is omitted when no locked design applies.
@@ -91,8 +91,9 @@ The agent brief in `agents/orchestrator.md` and the per-WP example below use the
 - **CONSUMES** / **PRODUCES**: …
 - **DO-NOT-TOUCH**: …
 - **DESIGN REFERENCE**: <designs/path> (if locked design exists)
-- **DEFINITION OF DONE**: …
-- **REPORT**: …
+- **DESIGNS**: D-01 — <title> · `designs/d-01-….html` · locked Round 3 · states: default, error, declined · (omit when `implements` is empty; mark phase-matched ones `(inferred)`)
+- **DEFINITION OF DONE**: … (for a designed surface: "matches the locked mockup of every D-NN above, state by state; PR body names them on its Designs implemented line")
+- **REPORT**: … (include `designs_implemented: [D-NN…]`, `[]` when none)
 - **MOCK** (if applicable): …
 
 ---
@@ -100,6 +101,9 @@ The agent brief in `agents/orchestrator.md` and the per-WP example below use the
 [ … one section per WP-NN … ]
 
 ---
+
+## PR body
+[ the template every WP PR uses — see §"PR body template" below ]
 
 ## Tracking protocol
 [ kickoff · live run · durable sync · blocked / needs-decision · merge order ]
@@ -178,6 +182,32 @@ The action writes only inside the fence. Hand intro is preserved on re-runs.
 
 ---
 
+## PR body template
+
+Every WP pull request (software profile) uses this body; `09` carries it under `## PR body` so subagents copy it verbatim. The **Designs implemented** line is required: list each `D-NN` the change implements, or `none`. `issue-sync` and the orchestrator parse this line into `register-design-impl`; a design-conformance review (`actions/review.md` §"Design reviews") is triggered by any `D-NN` on it.
+
+```markdown
+## WP-NN — <title>
+
+Closes #<issue>  ·  Plan: `<plan_slug>`  ·  Wave <n>
+
+Designs implemented: D-01, D-03        <!-- required; `none` when the change builds no designed surface -->
+
+### What changed
+- …
+
+### Definition of Done
+- [ ] … (copied from 09 §WP-NN)
+- [ ] Matches the locked mockup of every design above, state by state (default · empty · loading · error · … as the spec names)
+
+### Drift from the brief
+none  <!-- or one line per divergence; feeds the drift log -->
+```
+
+A PR that alters a locked design's appearance must cite the unlock Round (`design-unlock`) in "Drift from the brief"; without it the conformance review returns the PR.
+
+---
+
 ## Kickoff Task mirror (live status — WP-12)
 
 `orchestrate` itself does **not** create harness Tasks (it only writes `09`). The mirror happens at **kickoff**, driven by the orchestrator brief (`agents/orchestrator.md` §"Execution protocol · KICKOFF"): the orchestrator reads `05-tracking.md` and calls `TaskCreate` once per `WP-NN` (title `WP-NN <title>`, body = the WP's Definition of Done), mirroring wave deps where supported.
@@ -192,6 +222,12 @@ So the generated `09` always carries the kickoff Task-mirror instruction in its 
 
 ---
 
+## Merge confirmation (required)
+
+`orchestrate` itself only writes `09`, but the execution protocol it hands to the orchestrator ends in merges and a `pnpm install` - both outward or hard to undo (`pnpm install` runs dependency lifecycle scripts). So the generated `09` and the orchestrator brief carry this gate, and the calling session must honour it too: **before the first merge or install of a run, stop and confirm with the user** (`AskUserQuestion`) - name the target repo and branch, list the PRs / branches that will be merged in order, say that the install executes package scripts, and proceed only on an explicit yes. This is the same shape as the `issues` action's "Write confirmation". Reconciling `05`, Tasks and meta-repo commits needs no confirmation.
+
+---
+
 ## Emitting a runnable Workflow (`--emit-workflow`)
 
 **Opt-in.** Without the flag, orchestrate behaves exactly as today — prose `09` only. With `--emit-workflow`, after `09-orchestration.md` is written, also generate its **executable twin**: `artifact/orchestrate.workflow.js`, a Workflow script that fans out the build wave-by-wave instead of leaving execution to an improvising orchestrator agent.
@@ -202,11 +238,14 @@ This is worth it because the wave plan orchestrate already computes maps almost 
 
 1. Read the model with `python3 <skill>/scripts/groundwork_state.py board-data --plan <plan> --with-briefs` — emits each `WP-NN` with `id / title / wave / deps / gate / tier` **plus** its `brief` (parsed from the `09` §WP-NN section just written).
 2. Group WPs by `wave`, attach each wave's owning `gate` (from the freeze-gates table), in wave order → the `WAVES` array.
-3. Fill the template `profiles/_shared/templates/artifact/orchestrate.workflow.js`:
-   - `{{plan_title}}`, `{{slug}}` → string literals.
-   - `{{meta_phases}}` → one phase per wave, e.g. `[{title:'Wave 0 · G-CONTRACT'},{title:'Wave 1'}]` (must stay a **pure literal** — `meta` allows no variables).
-   - `{{waves_json}}` → the `WAVES` array as a JSON literal (`[{title, gate|null, wps:[{id,title,tier,brief}]}]`).
-4. Write `artifact/orchestrate.workflow.js`; register it in `.groundwork.json.docs` (whole-file hash; regenerated, never hand-edited).
+3. Render the template with the deterministic emitter - **never fill it by hand**:
+
+   ```bash
+   python3 <skill>/scripts/groundwork_state.py emit-workflow --plan <plan>
+   ```
+
+   It does steps 1-2 itself (reads the anchor + the `09` briefs, groups WPs by `wave`, attaches each wave's owning freeze gate), then fills `profiles/_shared/templates/artifact/orchestrate.workflow.js`. Every placeholder is an **unquoted JSON literal** produced by `json.dumps`: `{{name_js}}` / `{{description_js}}` (the workflow name and the description naming the plan title), `{{meta_phases}}` (one phase per wave, e.g. `[{"title":"Wave 0 · G-CONTRACT"},{"title":"Wave 1"}]` - a **pure literal**, `meta` allows no variables), `{{waves_json}}` (`[{title, gate|null, wps:[{id,title,tier,brief}]}]`). A plan title, slug, gate name or brief can therefore never leave its string and add code to the script; do not substitute any of them yourself.
+4. The command writes `artifact/orchestrate.workflow.js` atomically and registers it in `.groundwork.json.docs` (whole-file hash; regenerated, never hand-edited). It prints `WRITTEN` / `UNCHANGED`, so re-running is idempotent. It **refuses** (exit 1, nothing written) on a WP id that is not `WP-NN[a]`, a `tier` outside `opus` / `sonnet` / `haiku` (a missing tier becomes an explicit `sonnet`), a WP with no integer `wave`, a WP with no `### WP-NN` brief in `09`, or a malformed fence / duplicate `### WP-NN` header in `09`. Each agent call gets an explicit `model` and `effort` per tier (`opus` high · `sonnet` medium · `haiku` low); the gate verifier is `opus` / high.
 
 ### The no-filesystem invariant (why the script returns instead of writes)
 
